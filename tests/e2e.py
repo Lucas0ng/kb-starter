@@ -369,6 +369,29 @@ def main() -> None:
     text = sorted((kbdir / "99_工作区" / "粘贴包").glob("*.md"))[-1].read_text(encoding="utf-8")
     check("粘贴包带上新卡片", "截止电压定为 4.4 V" in text and "[[刘老师]]" in text)
 
+    # ---------------------------------------------------------- 9 知识库建在资料文件夹里面
+    print("\n9. 打开一个资料文件夹就开始：知识库建在它里面的「知识库/」")
+    inbox = base / "资料"
+    shutil.rmtree(inbox, ignore_errors=True)
+    inbox.mkdir()
+    (inbox / "组会纪要_1020.txt").write_text("刘老师：先做对照。\n", encoding="utf-8")
+    (inbox / "cycle_B60.csv").write_text("sample,capacity\nB60,150\n", encoding="utf-8")
+    (inbox / "想法.md").write_text("- 试试新添加剂\n", encoding="utf-8")
+    inner = inbox / "知识库"
+    before_inbox = digest_tree(inbox)
+    kb("scan", str(inbox), "--out", str(base / "w9"), "--kb", str(inner))
+    out = kb("apply", str(base / "w9" / "plan.csv"), "--kb", str(inner), "--name", "测试")
+    check("在资料文件夹里建库并对账通过", "✅ 原件完好、一个不漏、副本一致" in out)
+    check("资料文件夹里的原件没变", {k: v for k, v in digest_tree(inbox).items() if not k.startswith("知识库")} == before_inbox)
+    (inbox / "cycle_B61.csv").write_text("sample,capacity\nB61,151\n", encoding="utf-8")
+    kb("scan", str(inbox), "--out", str(base / "w9b"), "--kb", str(inner))
+    p9 = plan(base / "w9b" / "plan.csv")
+    check("以后新资料继续丢进同一个文件夹：只有新文件待入库，知识库自己不会被当成资料",
+          {n for n, r in p9.items() if r["状态"] == "复制"} == {"cycle_B61.csv"}
+          and not any("知识库" in r["原路径"].split("资料", 1)[1] for r in p9.values()), "、".join(p9))
+    out = kb("verify", str(base / "w9" / "plan.csv"), "--kb", str(inner), ok_codes=(0, 3))
+    check("新增文件在 verify 里被如实报告", "多了 1 个文件" in out and "cycle_B61.csv" in out)
+
     # ---------------------------------------------------------- 汇总
     failed = [r for r in results if not r[1]]
     print(f"\n共 {len(results)} 项检查，通过 {len(results) - len(failed)}，失败 {len(failed)}")
