@@ -392,6 +392,104 @@ def main() -> None:
     out = kb("verify", str(base / "w9" / "plan.csv"), "--kb", str(inner), ok_codes=(0, 3))
     check("新增文件在 verify 里被如实报告", "多了 1 个文件" in out and "cycle_B61.csv" in out)
 
+    # ---------------------------------------------------------- 10 纲要：先访谈，再按纲要分项目、写总览
+    print("\n10. 纲要：按用户定的主线分项目、生成总览草稿、体检对照")
+    kb10 = base / "kb10"
+    shutil.rmtree(kb10, ignore_errors=True)
+    kb10.mkdir()
+    (kb10 / "知识库纲要.md").write_text("""---
+title: 知识库纲要
+更新: 2026-10-16
+---
+
+# 测试 · 纲要
+
+## 这个知识库用来做什么
+
+读研期间的课题资料、综述和课程笔记。
+
+## 项目
+
+<!-- 注释里的示例不算：### 项目：示例项目 -->
+
+### 项目：电解液
+
+- 一句话目标：筛选能让锂电池在 4.4 V 下稳定循环的电解液添加剂
+- 现在在哪一步：第 1 轮添加剂筛选做完
+- 下一步：做 4 组浓度对照
+- 核心问题：
+  1. 添加剂浓度多少时循环最稳？
+  2. 高电压下容量衰减来自哪里？
+- 关键词：电解液、添加剂、截止电压、FEC、LiPF6、electrolyte、additive
+- 别名：电解液实验、battery
+- 大纲来源：开题报告_v2.docx
+
+### 项目：综述
+
+- 一句话目标：写一篇固态电解质综述
+- 现在在哪一步：初稿 v3
+- 核心问题：固态电解质界面问题有哪些解决思路？
+- 关键词：固态电解质、solid-state、综述、review
+
+### 课程：高分子物理
+
+- 一句话目标：期末考试
+- 关键词：高分子物理、polymer physics
+
+### 项目：{{项目名}}
+""", encoding="utf-8")
+    (src / "张老师给的").mkdir(exist_ok=True)  # 不是通用名、也不在纲要里的文件夹
+    (src / "张老师给的" / "参考资料.txt").write_text("一些背景材料\n", encoding="utf-8")
+    kb("scan", str(src), "--out", str(base / "w10"), "--kb", str(kb10))
+    p10 = plan(base / "w10" / "plan.csv")
+    want = {
+        "开题报告_v2.docx": "电解液",          # 根目录散落文件，首页标题命中关键词
+        "申请书_国自然.docx": "电解液",
+        "meeting_transcript.txt": "电解液",    # 正文提到“截止电压”
+        "随手想法.md": "电解液",               # 正文提到 FEC
+        "电解质综述_中文期刊.pdf": "综述",      # 文件名里的“综述”比正文里的 electrolyte 分高
+        "第3讲_高分子物理.pdf": "高分子物理",    # 文件夹名就是纲要里的课程
+        "组会汇报_20261010.pptx": "电解液",     # 文件夹名就是纲要项目
+        "seminar_notes.md": "",               # 什么都没命中
+    }
+    wrong = [f"{n} → {p10[n]['项目']!r}（{p10[n]['依据']}）" for n, proj in want.items() if p10[n]["项目"] != proj]
+    check("按纲要分项目：文件夹名、文件名、首页关键词", not wrong, "；".join(wrong))
+    check("依据里写明靠哪个关键词分的", "纲要关键词" in p10["开题报告_v2.docx"]["依据"])
+    md10 = (base / "w10" / "plan.md").read_text(encoding="utf-8")
+    check("plan.md 按纲要列项目，模板占位和注释里的示例不算项目",
+          "识别到的项目（以纲要为准）" in md10 and "- 电解液：" in md10 and "示例项目" not in md10 and "{{" not in md10)
+    check("纲要外的文件夹名被单独列出，通用文件夹名不算", "不在纲要里的项目名" in md10
+          and "- 张老师给的：1 个文件" in md10 and "papers" not in md10.split("不在纲要里的项目名")[-1])
+    check("两个项目打平时不硬分，留给 AI", p10["网页剪藏_电解液综述.md"]["项目"] == ""
+          and "同时命中" in p10["网页剪藏_电解液综述.md"]["依据"])
+    kb("apply", str(base / "w10" / "plan.csv"), "--kb", str(kb10), "--name", "测试", "--pending-to-unsorted", ok_codes=(0, 3))
+    check("已有纲要不会被空模板覆盖", "### 项目：电解液" in (kb10 / "知识库纲要.md").read_text(encoding="utf-8"))
+    out = kb("overview", str(kb10))
+    ov = (kb10 / "电解液_总览.md").read_text(encoding="utf-8") if (kb10 / "电解液_总览.md").exists() else ""
+    check("overview 为纲要里每个项目生成总览", all((kb10 / f"{n}_总览.md").exists() for n in ("电解液", "综述", "高分子物理")), out.strip())
+    check("【你定】段落照抄纲要", "## 一句话目标【你定】" in ov and "4.4 V 下稳定循环" in ov and "1. 添加剂浓度多少时循环最稳？" in ov)
+    check("【AI 整理】段落列出最近记录和现行文件候选", "最近的记录" in ov and "| 实验记录（候选） | [[" in ov and "| 会议记录（候选） | [[" in ov)
+    rows_ov = [ln for ln in ov.splitlines() if ln.startswith("| ") and "[[0" in ln]  # 带路径和别名的链接
+    check("表格里的链接竖线已转义，Obsidian 里表格不会被撑坏", rows_ov and all("\\|" in ln and ln.count(" | ") == 2 for ln in rows_ov))
+    recent_ov = ov.split("最近的记录")[1].split("##")[0]
+    check("最近的记录只列能反映进展的文件（不列照片、剪藏）", "· 照片 ·" not in recent_ov and "· 网页剪藏 ·" not in recent_ov)
+    check("同一行写的核心问题也能读出来", "1. 固态电解质界面问题有哪些解决思路？" in (kb10 / "综述_总览.md").read_text(encoding="utf-8"))
+    check("纲要没写的字段进待确认", "纲要里还没写「下一步」" in (kb10 / "高分子物理_总览.md").read_text(encoding="utf-8"))
+    out = kb("overview", str(kb10), "--project", "电解液")
+    check("总览已存在时不覆盖，草稿另存", "总览草稿" in out and (kb10 / "电解液_总览.md").read_text(encoding="utf-8") == ov)
+    lint10 = base / "lint10.md"
+    kb("lint", str(kb10), "--out", str(lint10))
+    lt = lint10.read_text(encoding="utf-8")
+    check("体检有纲要对照一节", "## 10. 纲要对照" in lt and "项目「电解液」" in lt and "课程「高分子物理」" in lt)
+    gp = kb("gaps", str(kb10))
+    check("缺口清单列出纲要核心问题", "## 6. 纲要里的核心问题（3）" in gp and "电解液：添加剂浓度多少时循环最稳？" in gp)
+    kb("pack", str(kb10))
+    pk = next((kb10 / "99_工作区" / "粘贴包").glob("*.md")).read_text(encoding="utf-8")
+    check("粘贴包把纲要放在最前面", pk.find("## 知识库纲要") != -1 and pk.find("## 知识库纲要") < pk.find("## 知识库导航"))
+    lint_old = base / "lint_old.md"
+    kb("lint", str(kbdir), "--out", str(lint_old))
+    check("没有纲要的库，体检提示补纲要", "还没有写好的 `知识库纲要.md`" in lint_old.read_text(encoding="utf-8"))
+
     # ---------------------------------------------------------- 汇总
     failed = [r for r in results if not r[1]]
     print(f"\n共 {len(results)} 项检查，通过 {len(results) - len(failed)}，失败 {len(failed)}")

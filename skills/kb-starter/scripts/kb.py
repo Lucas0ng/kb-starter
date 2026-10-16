@@ -341,6 +341,99 @@ def guess_project(rel: Path) -> str:
     return ""
 
 
+# ---------------------------------------------------------------- 知识库纲要
+#
+# 纲要由用户定：项目、目标、核心问题，以及把资料分到项目用的「关键词」「别名」。
+# 每个项目一节，标题写成「### 项目：名称」或「### 课程：名称」，字段写成顶格的「- 字段：值」。
+
+OUTLINE = "知识库纲要.md"
+OUTLINE_HEAD_RE = re.compile(r"^###\s*(项目|课程)\s*[：:]\s*(.+?)\s*$")
+OUTLINE_FIELD_RE = re.compile(r"^-\s*([^：:\s][^：:]{0,11})\s*[：:]\s*(.*)$")
+OUTLINE_ITEM_RE = re.compile(r"^\s+(?:\d+[.、)）]|[-*])\s*(.+)$")
+TERM_SPLIT_RE = re.compile(r"[,，、;；]+")
+
+
+def read_outline(path: Path | None) -> dict:
+    """解析纲要；没有纲要时返回空字典。模板占位符 {{…}} 和 HTML 注释里的示例都不算。"""
+    if not path or not path.exists():
+        return {}
+    text = re.sub(r"<!--.*?-->", "", path.read_text(encoding="utf-8", errors="ignore"), flags=re.S)
+    fm = read_frontmatter(text)
+    projects: list[dict] = []
+    cur, field, section, purpose = None, "", "", []
+    for line in body_of(text).splitlines():
+        if line.startswith("## "):
+            section, cur = line[3:].strip(), None
+            continue
+        m = OUTLINE_HEAD_RE.match(line)
+        if m:
+            cur, field = None, ""
+            if "{{" not in m.group(2):
+                cur = {"kind": m.group(1), "name": m.group(2), "fields": {}, "questions": []}
+                projects.append(cur)
+            continue
+        if line.startswith("### "):
+            cur = None
+            continue
+        if cur is None:
+            if section.startswith("这个知识库用来做什么") and line.strip() and "{{" not in line:
+                purpose.append(line.strip())
+            continue
+        f = OUTLINE_FIELD_RE.match(line)
+        if f:
+            field, value = f.group(1).strip(), f.group(2).strip()
+            cur["fields"][field] = "" if "{{" in value else value
+            continue
+        q = OUTLINE_ITEM_RE.match(line)
+        if q and field == "核心问题" and "{{" not in q.group(1):
+            cur["questions"].append(q.group(1).strip())
+    for p in projects:
+        def terms(key: str) -> list[str]:
+            return [t.strip() for t in TERM_SPLIT_RE.split(p["fields"].get(key, ""))
+                    if t.strip() and t.strip() not in ("待确认", "无", "跳过")]
+        p["aliases"], p["keywords"] = terms("别名"), terms("关键词")
+        if not p["questions"] and p["fields"].get("核心问题"):  # 写在同一行的问题
+            p["questions"] = [q.strip() for q in re.split(r"[；;]", p["fields"]["核心问题"]) if q.strip()]
+    return {"path": str(path), "updated": fm.get("更新", ""), "purpose": " ".join(purpose), "projects": projects}
+
+
+def term_hits(text: str, terms: list[str]) -> list[str]:
+    """和 kw_hits 一样：中文按子串匹配，英文要求前后不是字母数字。"""
+    t = text.lower()
+    hits = []
+    for term in terms:
+        tl = term.lower()
+        if tl.isascii():
+            if len(tl) >= 2 and re.search(r"(?<![a-z0-9])" + re.escape(tl) + r"(?![a-z0-9])", t):
+                hits.append(term)
+        elif tl in t:
+            hits.append(term)
+    return hits
+
+
+def outline_project(rel: Path, snippet: str, projects: list[dict]) -> tuple[str, str]:
+    """按纲要给文件定项目，返回 (项目, 依据)。项目为空、依据不为空表示两个项目打平，留给 AI。"""
+    for folder in rel.parts[:-1]:
+        for p in projects:
+            if folder.strip().lower() in {p["name"].lower(), *(a.lower() for a in p["aliases"])}:
+                return p["name"], f"所在文件夹「{folder}」是纲要项目"
+    name_ctx = " ".join(rel.parts)
+    scored = []
+    for p in projects:
+        terms = [p["name"], *p["aliases"], *p["keywords"]]
+        in_name = term_hits(name_ctx, terms)
+        in_body = [h for h in term_hits(snippet, terms) if h not in in_name]
+        score = 2 * len(in_name) + len(in_body)  # 文件名里的命中更可靠
+        if score:
+            scored.append((score, p["name"], in_name + in_body))
+    if not scored:
+        return "", ""
+    scored.sort(key=lambda s: -s[0])
+    if len(scored) > 1 and scored[0][0] == scored[1][0]:
+        return "", f"关键词同时命中「{scored[0][1]}」「{scored[1][1]}」"
+    return scored[0][1], f"纲要关键词「{'、'.join(scored[0][2][:3])}」"
+
+
 def locate_in_kb(rel_in_kb: Path) -> tuple[str, str]:
     """文件已在知识库里时，按它所在的目录反推 (类别, 项目)。"""
     parent = rel_in_kb.parent.as_posix()
@@ -617,6 +710,10 @@ def cmd_scan(args: argparse.Namespace) -> None:
     out.mkdir(parents=True, exist_ok=True)
     manifest = load_manifest(kb) if kb else {}
     ignored = load_ignored(kb) if kb else {}
+    outline_path = Path(args.outline).expanduser().resolve() if args.outline else (kb / OUTLINE if kb else None)
+    outline = read_outline(outline_path)
+    oprojects = outline.get("projects", [])
+    onames = {p["name"] for p in oprojects}
 
     files, folders = walk_source(src, kb)
     rows, snippets, seen = [], [], {}
@@ -679,6 +776,14 @@ def cmd_scan(args: argparse.Namespace) -> None:
         if privacy and status != STATUS_SKIP:
             status, conf = STATUS_AI, ""
             reason = f"疑似隐私文件（文件名含「{privacy[0]}」），先问用户是否入库；规则原判断：{cat or '无'}"
+        # 有纲要时，项目以纲要为准：文件夹名是纲要项目 > 纲要关键词 > 按文件夹名猜的
+        if oprojects and status in (STATUS_COPY, STATUS_AI):
+            proj, why = outline_project(rel, snippet, oprojects)
+            if proj or why:
+                row["项目"] = proj
+                reason += f"；{why}"
+            elif row["项目"] and row["项目"] not in onames:
+                reason += f"；文件夹名「{row['项目']}」不在纲要里"
         # 文件已经在知识库的 A/D 层里（用户手动放进去的）：只登记，不复制
         if kb and status != STATUS_SKIP:
             try:
@@ -707,6 +812,7 @@ def cmd_scan(args: argparse.Namespace) -> None:
             r["目标目录"] = dest_dir(r["类别"], r["项目"], r.get("子目录", ""))
 
     meta = {"src": str(src), "kb": str(kb) if kb else "", "扫描时间": dt.datetime.now().isoformat(timespec="seconds"),
+            "纲要": outline.get("path", ""), "纲要项目": [p["name"] for p in oprojects],
             "文件数": len(files) + sum(int(FOLDER_COUNT_RE.search(f["reason"]).group(1)) for f in folders
                                      if FOLDER_COUNT_RE.search(f["reason"]))}
     (out / "scan_meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -772,10 +878,26 @@ def write_plan_md(path: Path, rows: list[dict], meta: dict | None = None) -> Non
           "| # | 文件 | 原因 |", lambda r: f"| {r['id']} | {r['文件名']} | {r['依据']} |")
 
     projects = Counter(r["项目"] for r in rows if r["状态"] in (STATUS_COPY, STATUS_AI, STATUS_REGISTER))
+    oproj = meta.get("纲要项目") or []
+    if oproj:
+        lines += ["", "## 识别到的项目（以纲要为准）", ""]
+        for name in oproj:
+            n = projects.get(name, 0)
+            lines.append(f"- {name}：{n} 个文件" + ("" if n else "（⚠ 没分到任何文件：关键词可能不对，或还没有这个项目的资料）"))
+        others = [(p, n) for p, n in projects.most_common() if p and p not in oproj]
+        if others:
+            lines += ["", "不在纲要里的项目名（多半是文件夹名；并入纲要里的项目，或问用户要不要加进纲要）：", ""]
+            lines += [f"- {p}：{n} 个文件" for p, n in others]
+        if projects.get(""):
+            lines.append(f"\n未分项目：{projects['']} 个文件。很多的话，先补纲要关键词再扫一次。")
+        by_kw = sum(1 for r in rows if "纲要关键词" in r.get("依据", ""))
+        lines.append(f"\n其中 {by_kw} 个文件靠纲要关键词分到项目。纲要：`{meta.get('纲要', '')}`")
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return
     known: set[str] = set()
     if meta.get("kb"):
         known = {m["项目"] for m in load_manifest(Path(meta["kb"])).values() if m.get("项目")}
-    lines += ["", "## 识别到的项目", ""]
+    lines += ["", "## 识别到的项目", "", "> 没有知识库纲要，项目只按文件夹名猜。建议先做纲要访谈。", ""]
     for p, n in projects.most_common():
         note = ""
         if known and p and p not in known:
@@ -880,6 +1002,7 @@ GAP_LIST = "01_知识提炼/研究问题/缺口清单.md"
 LEDGER = "01_知识提炼/研究问题/假设台账.md"
 # templates/root 里的文件 → 在知识库中的位置
 PLACED_FILES = {
+    "知识库纲要.md": OUTLINE,  # 建库时 AI 通常已按访谈写好，这里只在缺失时放空模板
     "AGENTS.md": "AGENTS.md",
     "CLAUDE.md": "CLAUDE.md",
     "知识库导航.md": "知识库导航.md",
@@ -1624,12 +1747,48 @@ def cmd_lint(args: argparse.Namespace) -> None:
     elif newer:
         lines.append(f"- 知识索引已过期：{len(newer)} 张卡片比索引新，运行 `index` 更新")
 
+    lines += ["", "## 10. 纲要对照", "", "> 纲要由用户定。这里只列事实，改不改由用户决定，AI 在报告里提议。", ""]
+    lines += outline_report(kb, notes, changed, manifest)
+
     text = "\n".join(lines) + "\n"
     if args.out:
         Path(args.out).expanduser().write_text(text, encoding="utf-8")
         print(f"已写入 {args.out}")
     else:
         print(text)
+
+
+def outline_report(kb: Path, notes: list[Path], changed: list[Path], manifest: dict) -> list[str]:
+    outline = read_outline(kb / OUTLINE)
+    if not outline.get("projects"):
+        return ["- 还没有写好的 `知识库纲要.md`：建议按 kb-starter 的纲要访谈补一份，分项目、总览和体检都会更准"]
+    out = []
+    upd = outline.get("updated", "")[:10]
+    if DATE_RE.fullmatch(upd):
+        age = (dt.date.today() - dt.date.fromisoformat(upd)).days
+        if age > 60:
+            out.append(f"- 纲要 {age} 天没更新（{upd}）：项目阶段、核心问题可能已经变了")
+    in_manifest = Counter(m.get("项目", "") for m in manifest.values())
+    names = {p["name"] for p in outline["projects"]}
+    texts = {n: n.read_text(encoding="utf-8", errors="ignore") for n in changed}
+    for p in outline["projects"]:
+        terms = [p["name"], *p["aliases"]]
+        touched = [n for n in changed if term_hits(n.relative_to(kb).as_posix() + " " + texts[n][:3000], terms)]
+        flags = []
+        if not in_manifest.get(p["name"]):
+            flags.append("资料里没有分到它的文件")
+        if not touched:
+            flags.append("近期没有相关笔记改动")
+        if not (kb / f"{p['name']}_总览.md").exists():
+            flags.append("还没有项目总览（运行 overview）")
+        if not p["questions"]:
+            flags.append("纲要里没写核心问题")
+        state = "；".join(flags) if flags else "正常"
+        out.append(f"- {p['kind']}「{p['name']}」：{in_manifest.get(p['name'], 0)} 个资料文件，近期相关改动 {len(touched)} 篇 · {state}")
+    extra = [(k, v) for k, v in in_manifest.most_common() if k and k not in names]
+    if extra:
+        out.append("- 资料里有、纲要里没有的项目：" + "、".join(f"{k}（{v} 个文件）" for k, v in extra))
+    return out
 
 
 # ---------------------------------------------------------------- gaps：知识缺口的机械部分
@@ -1770,6 +1929,12 @@ def cmd_gaps(args: argparse.Namespace) -> None:
     lines += ["", f"## 5. 还在等证据的假设（{len(hyps)}）", ""]
     lines += [f"- {h}" for h in hyps] or ["- 无"]
 
+    outline = read_outline(kb / OUTLINE)
+    qs = [(p["name"], q) for p in outline.get("projects", []) for q in p["questions"]]
+    lines += ["", f"## 6. 纲要里的核心问题（{len(qs)}）", "",
+              "> 找缺口时以这些问题为准：哪个问题现在还答不上来，缺的是什么。", ""]
+    lines += [f"- {name}：{q}" for name, q in qs] or ["- 纲要里还没写核心问题（或还没有纲要）"]
+
     text = "\n".join(lines) + "\n"
     if args.out:
         Path(args.out).expanduser().write_text(text, encoding="utf-8")
@@ -1867,6 +2032,95 @@ def cmd_stats(args: argparse.Namespace) -> None:
         print(text)
 
 
+# ---------------------------------------------------------------- overview：按纲要生成项目总览草稿
+
+# 这些类别里最新的一份，作为“现行文件候选”
+CURRENT_CATS = ["实验记录", "会议记录", "论文草稿", "报告", "汇报PPT", "源稿"]
+# “最近的记录”只看能反映进展的类别；照片、下载的文献、剪藏、代码看不出做到了哪一步
+PROGRESS_CATS = set(CURRENT_CATS) | {"个人笔记"}
+
+
+def render_overview(p: dict, files: list[dict], today: dt.date) -> str:
+    f = p["fields"]
+    tbd = "待确认（纲要里还没写）"
+    link = lambda m: f"[[{m['知识库路径']}|{Path(m['知识库路径']).name}]]"
+    cell = lambda m: link(m).replace("|", "\\|")  # 表格里的竖线要转义，否则会把表格撑坏
+    day = lambda m: dt.date.fromtimestamp(m["_mtime"]).isoformat() if m["_mtime"] else "日期不明"
+    current = [m for m in files if "/历史版本" not in m["知识库路径"]]
+    by_cat: dict[str, list[dict]] = defaultdict(list)
+    for m in sorted(current, key=lambda m: -m["_mtime"]):
+        by_cat[m["类别"]].append(m)
+
+    aliases = "".join(f"\n  - {a}" for a in [p["name"], *p["aliases"]])
+    lines = [
+        "---", f"title: {p['name']} · 总览", f"aliases:{aliases}", "tags:", f"  - 项目/{p['name']}", "  - 类型/项目总览",
+        f"状态: {f.get('现在在哪一步') or '待确认'}", f"创建: {today}", f"更新: {today}", "---", "",
+        f"# {p['name']} · 总览", "",
+        "> [!info] 这份总览谁来写",
+        "> 标【你定】的段落来自 [[知识库纲要]]，只有你能改；要改就先改纲要，再同步到这里。",
+        "> 标【AI 整理】的段落由 AI 从资料里整理，你确认后去掉“待确认”。",
+        f"> 总览只写“现在”。历次进展写到 [[{p['name']}_进展时间线]]。", "",
+        "## 一句话目标【你定】", "", f.get("一句话目标") or tbd, "",
+        "## 核心问题【你定】", "",
+    ]
+    lines += [f"{i}. {q}" for i, q in enumerate(p["questions"], 1)] or [f"- {tbd}"]
+    lines += ["", "每个核心问题在 [[假设台账]] 里有对应条目。", "",
+              f"## 当前状态（{today}）", "",
+              f"**你说的**【你定】：现在 {f.get('现在在哪一步') or '待确认'}；下一步 {f.get('下一步') or '待确认'}。", "",
+              "**资料显示的进展**【AI 整理】：待 AI 读下面的最近记录后补写。", "",
+              "最近的记录（实验、会议、汇报、报告、草稿和笔记，按文件时间倒序）：", ""]
+    recent = sorted((m for m in current if m["类别"] in PROGRESS_CATS), key=lambda m: -m["_mtime"])[:5]
+    lines += [f"- {day(m)} · {m['类别']} · {link(m)}" for m in recent] or ["- 资料里还没有这类记录"]
+    lines += ["", "## 现行执行文件【AI 整理 · 待你确认】", "",
+              "> 这张表就是“现在该看的全部文件”。下面是每类最新的一份，AI 读过后改成真正的步骤和口径；被替代的文件移到 `历史版本/`。", "",
+              "| 步骤/用途 | 现行文件 | 当前口径 |", "|---|---|---|"]
+    cands = [(c, by_cat[c][0]) for c in CURRENT_CATS if by_cat.get(c)]
+    lines += [f"| {c}（候选） | {cell(m)} | 待 AI 补写 |" for c, m in cands] or ["| | | |"]
+    lines += ["", "## 待确认", "", "- 现行执行文件：上表是按时间挑的候选，需要你确认。"]
+    if not files:
+        lines.append("- 纲要里有这个项目，但资料里还没有分到它的文件。")
+    for key in ("一句话目标", "现在在哪一步", "下一步"):
+        if not f.get(key):
+            lines.append(f"- 纲要里还没写「{key}」。")
+    if not p["questions"]:
+        lines.append("- 纲要里还没写「核心问题」。")
+    lines += ["", "## 资料概况【AI 整理】", "", "| 类别 | 文件数 | 最近一份 |", "|---|---|---|"]
+    lines += [f"| {c} | {len(ms)} | {cell(ms[0])}（{day(ms[0])}） |"
+              for c, ms in sorted(by_cat.items(), key=lambda kv: -len(kv[1]))] or ["| | 0 | |"]
+    old = len(files) - len(current)
+    if old:
+        lines.append(f"\n另有 {old} 份旧版本在 `历史版本/` 里。")
+    lines += ["", "## 背景与依据", "", "| 类别 | 笔记 |", "|---|---|",
+              "| 核心概念 | |", "| 文献 | |", "| 决策 | |", "| 原始记录 | [[资料索引]] |", "| 成品 | |", ""]
+    return "\n".join(lines)
+
+
+def cmd_overview(args: argparse.Namespace) -> None:
+    kb = Path(args.kb).expanduser().resolve()
+    outline = read_outline(kb / OUTLINE)
+    projects = outline.get("projects", [])
+    if args.project:
+        projects = [p for p in projects if p["name"] == args.project]
+    if not projects:
+        print(f"纲要里没有{'项目「' + args.project + '」' if args.project else '任何项目'}：先按纲要访谈写好 {OUTLINE}。",
+              file=sys.stderr)
+        sys.exit(2)
+    manifest = load_manifest(kb)
+    today = dt.date.today()
+    for p in projects:
+        files = [dict(m) for m in manifest.values() if m.get("项目") == p["name"]]
+        for m in files:
+            st = stat_quiet(kb / m["知识库路径"])
+            m["_mtime"] = st.st_mtime if st else 0
+        target = kb / f"{p['name']}_总览.md"
+        if target.exists() and not args.force:
+            target = kb / "99_工作区/总览草稿" / f"{p['name']}_总览-草稿-{today:%Y%m%d}.md"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(render_overview(p, files, today), encoding="utf-8")
+        where = "（总览已存在，草稿另存，请合并）" if target.parent.name == "总览草稿" else ""
+        print(f"{p['name']}：{len(files)} 个文件 → {target.relative_to(kb)}{where}")
+
+
 # ---------------------------------------------------------------- pack
 
 def body_of(text: str) -> str:
@@ -1898,6 +2152,9 @@ def cmd_pack(args: argparse.Namespace) -> None:
         "请把它当作回答的背景：优先依据这里的信息；这里没有的，请直接说明需要我提供哪份原文，不要自行补全数据或结论。",
         "",
     ]
+    outline = kb / OUTLINE
+    if read_outline(outline).get("projects"):  # 主线放最前面，网页版 AI 先知道我在做什么
+        parts += ["---", "## 知识库纲要", "", body_of(re.sub(r"<!--.*?-->", "", outline.read_text(encoding="utf-8"), flags=re.S))]
     nav = kb / "知识库导航.md"
     if nav.exists():
         parts += ["---", "## 知识库导航", "", body_of(nav.read_text(encoding="utf-8"))]
@@ -1949,7 +2206,8 @@ def main() -> None:
     s = sub.add_parser("scan", help="扫描资料并生成分类方案表")
     s.add_argument("src", help="零散资料所在文件夹")
     s.add_argument("--out", required=True, help="方案表输出目录（建议放在知识库外的临时目录）")
-    s.add_argument("--kb", help="已有知识库路径；给出时会跳过已入库的文件")
+    s.add_argument("--kb", help="已有知识库路径；给出时会跳过已入库的文件，并读取其中的知识库纲要")
+    s.add_argument("--outline", help="知识库纲要路径（默认 <知识库>/知识库纲要.md）；按其中的项目和关键词分项目")
     s.set_defaults(func=cmd_scan)
 
     d = sub.add_parser("decide", help="把 AI 的判断写回方案表")
@@ -1970,6 +2228,12 @@ def main() -> None:
     v.add_argument("--kb", required=True, help="知识库路径")
     v.add_argument("--full", action="store_true", help="重新计算原件哈希（慢，但最彻底）")
     v.set_defaults(func=cmd_verify)
+
+    o = sub.add_parser("overview", help="按纲要生成项目总览草稿（【你定】照抄纲要，【AI 整理】从资料清单填）")
+    o.add_argument("kb", help="知识库路径")
+    o.add_argument("--project", help="只生成某个项目")
+    o.add_argument("--force", action="store_true", help="覆盖已有总览（默认已有时草稿另存到 99_工作区/总览草稿/）")
+    o.set_defaults(func=cmd_overview)
 
     x = sub.add_parser("index", help="生成知识索引（AI 开工先读的记忆入口）")
     x.add_argument("kb", help="知识库路径")
