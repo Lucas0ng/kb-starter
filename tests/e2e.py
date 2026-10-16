@@ -490,6 +490,64 @@ title: 知识库纲要
     kb("lint", str(kbdir), "--out", str(lint_old))
     check("没有纲要的库，体检提示补纲要", "还没有写好的 `知识库纲要.md`" in lint_old.read_text(encoding="utf-8"))
 
+    # ---------------------------------------------------------- 11 先整理、后审查：整理规则 + reorg
+    print("\n11. 先整理后审查：自动生成整理规则，用户改规则后 reorg 挪副本")
+    rules_md = kb10 / "整理规则.md"
+    rt = rules_md.read_text(encoding="utf-8") if rules_md.exists() else ""
+    check("apply 自动生成整理规则报告", all(s in rt for s in ("## 你的规则（优先）", "### A. 先看这几条", "### B. 分类规则",
+                                                    "### C. 项目规则", "### D. 不入库", "| B1 |")))
+    check("隐私文件没进待定、没入库，也没记成“已决定不入库”",
+          not list(kb10.rglob("身份证*")) and "隐私待定" in rt
+          and "身份证" not in (kb10 / ".kb" / "ignored.csv").read_text(encoding="utf-8-sig") if (kb10 / ".kb" / "ignored.csv").exists() else True)
+    a_part = rt.split("### A.")[1].split("### B.")[0]
+    b_part = rt.split("### B.")[1].split("### C.")[0]
+    check("A 里列过的文件不在 B 里重复", "untitled.png" in a_part and "untitled.png" not in b_part)
+    check("按文件夹猜的纲要外项目在 C 里标出来", "（纲要里没有这个项目）" in rt)
+
+    rt = rt.replace("| 匹配 | 看哪里 | 归为 | 项目 | 为什么 |\n|---|---|---|---|---|\n",
+                    "| 匹配 | 看哪里 | 归为 | 项目 | 为什么 |\n|---|---|---|---|---|\n"
+                    "| slides | 文件名 | 课程资料 | 高分子物理 | slides 都是课件 |\n"
+                    "| 张老师给的 | 文件夹 | | 电解液 | 张老师给的是电解液参考资料 |\n"
+                    "| metadata_update | 文件名 | 不入库 | | 没用的导出文件 |\n"
+                    "| 乱写 | 文件名 | 不存在的类别 | | 这一行应被忽略 |\n", 1)
+    rules_md.write_text(rt, encoding="utf-8")
+    before_src = digest_tree(src)
+    man_before = (kb10 / ".kb" / "manifest.csv").read_text(encoding="utf-8-sig")
+    out = kb("reorg", str(kb10), "--dry-run")
+    check("reorg 预演列出 3 个文件、不改动，并提示无效规则",
+          out.count("[预演]") == 4 and "不存在的类别" in out
+          and (kb10 / ".kb" / "manifest.csv").read_text(encoding="utf-8-sig") == man_before, out.strip())
+    ov_before = (kb10 / "电解液_总览.md").read_text(encoding="utf-8")
+    out = kb("reorg", str(kb10))
+    print("  " + out.strip().replace("\n", "\n  "))
+    new_slides = kb10 / "00_原始资料/05_课程笔记/高分子物理/slides_final.pptx"
+    check("规则改类别：slides 挪到课程资料", new_slides.exists() and not (kb10 / "03_研究输出/汇报PPT/电解液/slides_final.pptx").exists())
+    check("规则只改项目：张老师给的 → 电解液", (kb10 / "00_原始资料/06_个人笔记/电解液/参考资料.txt").exists())
+    check("规则不入库：副本移到 .kb/回收（可恢复），清单里删掉",
+          not list((kb10 / "00_原始资料").rglob("metadata_update.csv")) and list((kb10 / ".kb" / "回收").rglob("metadata_update.csv"))
+          and "metadata_update" not in (kb10 / ".kb" / "manifest.csv").read_text(encoding="utf-8-sig"))
+    ov_after = (kb10 / "电解液_总览.md").read_text(encoding="utf-8")
+    check("总览里指向挪走文件的链接跟着更新", "汇报PPT/电解液/slides_final.pptx" in ov_before
+          and "汇报PPT/电解液/slides_final.pptx" not in ov_after and "05_课程笔记/高分子物理/slides_final.pptx" in ov_after)
+    check("reorg 不碰原件", digest_tree(src) == before_src)
+    archived = sorted((kb10 / ".kb" / "plans").glob("*-plan.csv"))[-1]
+    out = kb("verify", str(archived), "--kb", str(kb10), ok_codes=(0, 3))
+    check("reorg 之后对账仍通过（移出的算“按规则移出”）", "✅" in out and "事后按整理规则移出" in out, out.strip()[-300:])
+    check("变更日志记了 [整理]", "[整理] **按整理规则重新整理**" in (kb10 / "知识库变更日志.md").read_text(encoding="utf-8"))
+
+    pptx_src = src / "电解液" / "slides_final.pptx"
+    (src / "电解液" / "slides_week2.pptx").write_bytes(pptx_src.read_bytes() + b"week2")
+    kb("scan", str(src), "--out", str(base / "w11"), "--kb", str(kb10))
+    p11 = plan(base / "w11" / "plan.csv")
+    check("以后入库先套用你的规则", p11["slides_week2.pptx"]["类别"] == "课程资料" and p11["slides_week2.pptx"]["项目"] == "高分子物理"
+          and p11["slides_week2.pptx"]["依据"].startswith("你的规则 1"), p11["slides_week2.pptx"]["依据"])
+    check("移出的文件以后不再入库", p11["metadata_update.csv"]["状态"] == "跳过", p11["metadata_update.csv"]["依据"])
+    check("隐私文件下次扫描仍会提醒", p11["身份证扫描.jpg"]["状态"] == "待AI")
+    kb("apply", str(base / "w11" / "plan.csv"), "--kb", str(kb10), "--pending-to-unsorted", ok_codes=(0, 3))
+    rt2 = rules_md.read_text(encoding="utf-8")
+    check("再次 apply：你的规则原样保留，报告写明规则用了几次",
+          "| slides | 文件名 | 课程资料 | 高分子物理 |" in rt2 and "规则 1 用了 1 次" in rt2 and rt2.count("## 最近一次整理用到的规则") == 1)
+
     # ---------------------------------------------------------- 汇总
     failed = [r for r in results if not r[1]]
     print(f"\n共 {len(results)} 项检查，通过 {len(results) - len(failed)}，失败 {len(failed)}")

@@ -21,6 +21,7 @@ import argparse
 import csv
 import datetime as dt
 import difflib
+import fnmatch
 import hashlib
 import json
 import os
@@ -86,7 +87,8 @@ STATUS_BLOCKED = "无法读取"  # iCloud 未下载、没有读权限、失效�
 # 子目录：放在目标目录下的一层，用于“历史版本”或同名文件保留来源文件夹；入库名：给无意义文件名起的新名字（只改副本）
 PLAN_FIELDS = ["id", "状态", "类别", "项目", "子目录", "入库名", "目标目录", "文件名", "原路径", "依据", "置信度",
                "大小KB", "日期", "修改时间", "sha256"]
-MANIFEST_FIELDS = ["sha256", "知识库路径", "原路径", "类别", "项目", "入库时间"]
+# 来源相对路径：相对资料文件夹的路径，reorg 按它套用整理规则（旧清单没有这一列时退回用原路径的最后几层）
+MANIFEST_FIELDS = ["sha256", "知识库路径", "原路径", "类别", "项目", "入库时间", "来源相对路径"]
 
 # ---------------------------------------------------------------- 关键词规则（只匹配文件名、所在文件夹名和文档标题）
 
@@ -434,6 +436,63 @@ def outline_project(rel: Path, snippet: str, projects: list[dict]) -> tuple[str,
     return scored[0][1], f"纲要关键词「{'、'.join(scored[0][2][:3])}」"
 
 
+# ---------------------------------------------------------------- 整理规则
+#
+# 知识库根目录的 整理规则.md 分两半：
+#   「你的规则」：用户写的表格，优先级最高，scan 和 reorg 都按它来；
+#   「最近一次整理用到的规则」：apply 自动生成，把这次的分类归纳成几十条规则，供用户事后审查。
+
+RULES_FILE = "整理规则.md"
+RULES_REPORT_HEAD = "## 最近一次整理用到的规则"
+SKIP_WORDS = {"不入库", "跳过", "不要"}
+PRIVACY_HOLD = "隐私待定"  # 疑似隐私文件默认不入库、等用户决定；不记进 ignored，下次扫描还会提醒
+
+
+def read_user_rules(kb: Path | None) -> list[dict]:
+    """解析「你的规则」表：| 匹配 | 看哪里 | 归为 | 项目 | 为什么 |。注释、表头、空行不算。"""
+    path = kb / RULES_FILE if kb else None
+    if not path or not path.exists():
+        return []
+    text = re.sub(r"<!--.*?-->", "", path.read_text(encoding="utf-8", errors="ignore"), flags=re.S)
+    m = re.search(r"^## 你的规则.*?$(.*?)(?=^## |\Z)", text, flags=re.M | re.S)
+    rules = []
+    for line in (m.group(1) if m else "").splitlines():
+        cells = [c.strip() for c in line.strip().strip("|").split("|")] if line.strip().startswith("|") else []
+        if len(cells) < 3 or not cells[0] or cells[0] == "匹配" or set(cells[0]) <= set("-: "):
+            continue
+        cells += [""] * (5 - len(cells))
+        pattern, where, cat, proj, why = (c.strip("`") for c in cells[:5])
+        if cat and cat not in CATEGORIES and cat not in SKIP_WORDS:
+            print(f"整理规则里的「{cat}」不是可用的类别，这一行先不用：{line.strip()}", file=sys.stderr)
+            continue
+        if not cat and not proj:
+            continue
+        rules.append({"n": len(rules) + 1, "匹配": pattern, "看哪里": where or "路径", "归为": cat, "项目": proj, "为什么": why})
+    return rules
+
+
+def rule_matches(rule: dict, rel: Path) -> bool:
+    """rel 是文件相对资料文件夹的路径。可以用 * ? 通配，否则按“包含”匹配，不分大小写。"""
+    pat = rule["匹配"].lower()
+    where = rule["看哪里"]
+    name, folders = rel.name.lower(), [p.lower() for p in rel.parts[:-1]]
+    wild = any(ch in pat for ch in "*?[")
+    if where.startswith("文件名"):
+        return fnmatch.fnmatch(name, pat) if wild else pat in name
+    if where.startswith("文件夹"):
+        return any(fnmatch.fnmatch(f, pat) if wild else pat in f for f in folders)
+    full = "/".join(folders + [name])
+    return fnmatch.fnmatch(full, pat if pat.startswith("*") else f"*{pat}*") if wild else pat in full
+
+
+def apply_user_rule(rules: list[dict], rel: Path) -> dict | None:
+    return next((r for r in rules if rule_matches(r, rel)), None)
+
+
+def rule_label(rule: dict) -> str:
+    return f"你的规则 {rule['n']}（{rule['看哪里']}含「{rule['匹配']}」）"
+
+
 def locate_in_kb(rel_in_kb: Path) -> tuple[str, str]:
     """文件已在知识库里时，按它所在的目录反推 (类别, 项目)。"""
     parent = rel_in_kb.parent.as_posix()
@@ -714,6 +773,7 @@ def cmd_scan(args: argparse.Namespace) -> None:
     outline = read_outline(outline_path)
     oprojects = outline.get("projects", [])
     onames = {p["name"] for p in oprojects}
+    user_rules = read_user_rules(kb)
 
     files, folders = walk_source(src, kb)
     rows, snippets, seen = [], [], {}
@@ -784,6 +844,19 @@ def cmd_scan(args: argparse.Namespace) -> None:
                 reason += f"；{why}"
             elif row["项目"] and row["项目"] not in onames:
                 reason += f"；文件夹名「{row['项目']}」不在纲要里"
+        # 用户的整理规则优先于一切规则判断（包括隐私提醒：用户明确写了规则，就是用户的决定）
+        rule = apply_user_rule(user_rules, rel) if status != STATUS_SKIP else None
+        if rule:
+            label = rule_label(rule)
+            if rule["归为"] in SKIP_WORDS:
+                status, cat, conf, reason = STATUS_SKIP, "", "高", f"{label}：不入库"
+            elif rule["归为"]:  # 类别由规则定（可能连项目一起定）
+                status, cat, conf = STATUS_COPY, rule["归为"], "高"
+                reason = f"{label} → {cat}" + (f"，项目「{rule['项目']}」" if rule["项目"] else "")
+            else:  # 只改项目，类别仍按原判断（待AI 的还要 AI 判断）
+                reason += f"；{label} → 项目「{rule['项目']}」"
+            if rule["项目"]:
+                row["项目"] = rule["项目"]
         # 文件已经在知识库的 A/D 层里（用户手动放进去的）：只登记，不复制
         if kb and status != STATUS_SKIP:
             try:
@@ -1003,6 +1076,7 @@ LEDGER = "01_知识提炼/研究问题/假设台账.md"
 # templates/root 里的文件 → 在知识库中的位置
 PLACED_FILES = {
     "知识库纲要.md": OUTLINE,  # 建库时 AI 通常已按访谈写好，这里只在缺失时放空模板
+    "整理规则.md": RULES_FILE,
     "AGENTS.md": "AGENTS.md",
     "CLAUDE.md": "CLAUDE.md",
     "知识库导航.md": "知识库导航.md",
@@ -1283,14 +1357,19 @@ def reconcile(rows: list[dict], kb: Path, meta: dict, full: bool = False) -> tup
     if vanished:
         problems.append(f"方案里有 {len(vanished)} 个文件已不在原位置（不是本工具移动的）：" + "、".join(Path(p).name for p in vanished[:10]))
 
-    # 2. 每个要入库的文件都在清单里、副本存在、内容一致
+    # 2. 每个要入库的文件都在清单里、副本存在、内容一致（事后按整理规则移出的不算问题）
     copied_ok = 0
+    ignored = load_ignored(kb)
+    moved_out = 0
     for r in file_rows:
         if r["状态"] not in (STATUS_COPY, STATUS_REGISTER):
             if not r.get("依据"):
                 problems.append(f"#{r['id']} {r['文件名']} 状态是「{r['状态']}」但没有写理由")
             continue
         m = manifest.get(r.get("sha256", ""))
+        if not m and "移出知识库" in ignored.get(r.get("sha256", ""), ""):
+            moved_out += 1
+            continue
         if not m:
             problems.append(f"#{r['id']} {r['文件名']} 应入库但不在清单里")
             continue
@@ -1327,7 +1406,7 @@ def reconcile(rows: list[dict], kb: Path, meta: dict, full: bool = False) -> tup
     body = [
         f"- 来源共 **{total}** 个文件 = 复制 {c.get(STATUS_COPY, 0)} + 登记 {c.get(STATUS_REGISTER, 0)} + 已入库 {c.get(STATUS_DONE, 0)}"
         f" + 跳过 {c.get(STATUS_SKIP, 0)} + 无法读取 {c.get(STATUS_BLOCKED, 0)} + 未展开文件夹内 {in_folders}",
-        f"- 副本校验：{copied_ok}/{need} 个与原件哈希一致",
+        f"- 副本校验：{copied_ok}/{need - moved_out} 个与原件哈希一致" + (f"（另有 {moved_out} 个事后按整理规则移出知识库）" if moved_out else ""),
         f"- 原件检查（{'重新计算哈希' if full else '比对修改时间'}）：{'有改动' if changed else '均未改动'}",
         f"- 扫描后新增 {len(unplanned)} 个，消失 {len(vanished)} 个",
     ]
@@ -1367,9 +1446,16 @@ def cmd_apply(args: argparse.Namespace) -> None:
     manifest = load_manifest(kb)
     now = dt.datetime.now().isoformat(timespec="seconds")
     copied, registered, existed, renamed = [], [], [], []
+    src_root = Path(meta["src"]) if meta.get("src") else None
+    held = 0
     for r in rows:
         status = r["状态"]
         if status == STATUS_AI and args.pending_to_unsorted:
+            if "疑似隐私" in r["依据"]:  # 隐私文件不能“先放进待定再说”：没人决定就不入库
+                status = r["状态"] = STATUS_SKIP
+                r["依据"] = f"{PRIVACY_HOLD}：默认不入库，等你决定（{r['依据']}）"
+                held += 1
+                continue
             status = r["状态"] = STATUS_COPY
             r["类别"], r["子目录"] = "待定", ""
         if status not in (STATUS_COPY, STATUS_REGISTER):
@@ -1402,9 +1488,13 @@ def cmd_apply(args: argparse.Namespace) -> None:
                 target_dir.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(src, target)  # 复制，保留时间戳；原件不动
             copied.append(r)
+        try:
+            rel_src = src.relative_to(src_root).as_posix() if src_root else ""
+        except ValueError:
+            rel_src = ""
         manifest[digest] = {
             "sha256": digest, "知识库路径": str(target.relative_to(kb)), "原路径": str(src),
-            "类别": r["类别"], "项目": r["项目"], "入库时间": now,
+            "类别": r["类别"], "项目": r["项目"], "入库时间": now, "来源相对路径": rel_src,
         }
 
     if args.dry_run:
@@ -1421,7 +1511,8 @@ def cmd_apply(args: argparse.Namespace) -> None:
     # AI 或用户决定不入库的文件记下来，下次扫描同一份文件时不再问
     ignored = load_ignored(kb)
     for r in rows:
-        if r["状态"] == STATUS_SKIP and r.get("sha256") and r["依据"].startswith("AI："):
+        if (r["状态"] == STATUS_SKIP and r.get("sha256") and r["依据"].startswith("AI：")
+                and PRIVACY_HOLD not in r["依据"]):
             ignored[r["sha256"]] = f"{r['文件名']} · {r['依据'][3:]}"
     if ignored:
         with (kb / ".kb" / "ignored.csv").open("w", encoding="utf-8-sig", newline="") as f:
@@ -1434,10 +1525,13 @@ def cmd_apply(args: argparse.Namespace) -> None:
     n = 2
     while (plans_dir / f"{stamp}-plan.csv").exists():  # 同一秒内两次入库，存档不能互相覆盖
         stamp, n = f"{base_stamp}-{n}", n + 1
+    write_plan(plan_csv, rows)  # 待AI 放进待定、隐私默认不入库这些改动也要留在存档里，事后 verify 才对得上
     shutil.copy2(plan_csv, plans_dir / f"{stamp}-plan.csv")
     if plan_csv.with_name("scan_meta.json").exists():
         shutil.copy2(plan_csv.with_name("scan_meta.json"), plans_dir / f"{stamp}-scan_meta.json")
     write_source_index(kb)
+    if copied or registered or held:
+        write_rules_report(kb, rows, stamp, read_user_rules(kb))
 
     problems, body = reconcile(rows, kb, meta)
     report = write_reconcile(kb, stamp, problems, body)
@@ -1456,7 +1550,9 @@ def cmd_apply(args: argparse.Namespace) -> None:
         print("类别：" + detail)
     for x in renamed:
         print(f"改名入库：{x}")
-    print("已更新：.kb/manifest.csv、00_原始资料/资料索引.md、知识库变更日志.md")
+    print("已更新：.kb/manifest.csv、00_原始资料/资料索引.md、知识库变更日志.md、整理规则.md（本次用到的规则，供用户审查）")
+    if held:
+        print(f"⚠ {held} 个疑似隐私文件没有入库，等用户决定（见 整理规则.md「先看这几条」）")
     print(f"\n对账单：{report}")
     print("\n".join(body))
     for p in problems:
@@ -1464,6 +1560,232 @@ def cmd_apply(args: argparse.Namespace) -> None:
     if problems:
         sys.exit(3)
     print("✅ 原件完好、一个不漏、副本一致")
+
+
+# ---------------------------------------------------------------- 整理规则报告与 reorg
+
+def norm_reason(seg: str) -> str:
+    """把一条依据里因文件而异的部分去掉，同一条规则的文件才能归到一起。"""
+    seg = re.sub(r"\s*10\.\d{4,9}/\S+", "", seg)
+    seg = re.sub(r"（EXIF [^）]*）|（指向 [^）]*）", "", seg)
+    seg = re.sub(r"含 \d+ 个文件", "含若干文件", seg)
+    seg = re.sub(r"与 #\d+ 内容完全相同", "与另一个文件内容完全相同", seg)
+    seg = re.sub(r"第\d+([讲课章])", r"第N\1", seg)
+    return seg.strip()
+
+
+def project_source(r: dict) -> str:
+    segs = r["依据"].split("；")
+    proj = r.get("项目", "")
+    for s in segs:
+        if s.startswith("你的规则") and "项目" in s:
+            return s.split("→")[0].strip() + f" → 项目「{proj}」"
+    for s in segs[1:]:
+        if s.startswith("所在文件夹") and "纲要项目" in s:
+            return f"{s} → 项目「{proj}」"
+        if s.startswith("纲要关键词"):
+            return f"按纲要关键词 → 项目「{proj}」"
+        if "不在纲要里" in s:
+            return f"按{s.split('不在')[0]}猜 → 项目「{proj}」（纲要里没有这个项目）"
+    if not proj:
+        return "没有归到任何项目"
+    if r["依据"].startswith("AI："):
+        return f"AI 看内容判断 → 项目「{proj}」"
+    return f"按所在文件夹名猜 → 项目「{proj}」"
+
+
+def rules_report(rows: list[dict], stamp: str, user_rules: list[dict]) -> list[str]:
+    esc = lambda s: s.replace("|", "\\|")
+    files = [r for r in rows if not r["文件名"].endswith("/")]
+    c = Counter(r["状态"] for r in files)
+    examples = lambda rs: "、".join(esc(r.get("入库名") or r["文件名"]) for r in rs[:3]) + (" 等" if len(rs) > 3 else "")
+    used = Counter(int(m.group(1)) for r in rows for m in [re.search(r"你的规则 (\d+)", r["依据"])] if m)
+    held = [r for r in rows if PRIVACY_HOLD in r["依据"]]
+    lines = [
+        f"{RULES_REPORT_HEAD}（{stamp[:4]}-{stamp[4:6]}-{stamp[6:8]} {stamp[9:11]}:{stamp[11:13]}，自动生成）", "",
+        f"本次 {len(files)} 个文件：复制 {c.get(STATUS_COPY, 0)}、登记 {c.get(STATUS_REGISTER, 0)}、已入库 {c.get(STATUS_DONE, 0)}、"
+        f"不入库 {c.get(STATUS_SKIP, 0) - len(held)}、疑似隐私待你决定 {len(held)}、读不了 {c.get(STATUS_BLOCKED, 0)}。"
+        f"方案表存于 `.kb/plans/{stamp}-plan.csv`。",
+    ]
+    if user_rules:
+        lines.append("你的规则这次生效：" + ("、".join(f"规则 {n} 用了 {k} 次" for n, k in sorted(used.items())) or "都没有匹配到文件") + "。")
+    lines += ["", "> 哪条不对，直接对 AI 说「B3 不对，应该……」。AI 会在上面「你的规则」里加一行，再运行 `reorg` 把知识库里的副本挪过去；原件不受影响。", ""]
+
+    def table(title: str, note: str, head: str, body: list[str]) -> None:
+        if body:
+            lines.extend([f"### {title}", ""] + ([f"> {note}", ""] if note else []))
+            lines.extend([head, "|" + "---|" * (head.count("|") - 1)] + body + [""])
+
+    # A 先看：AI 逐个判断的、打平的、低置信度、放进待定的、没入库的隐私文件、读不了的
+    a_rows = [r for r in files if (r["状态"] in (STATUS_COPY, STATUS_SKIP) and r["依据"].startswith("AI："))
+              or (r["状态"] == STATUS_COPY and (r["置信度"] == "低" or r["类别"] == "待定" or "同时命中" in r["依据"]))
+              or PRIVACY_HOLD in r["依据"] or r["状态"] == STATUS_BLOCKED]
+    def outcome(r: dict) -> str:
+        if r["状态"] == STATUS_COPY:
+            return f"`{dest_dir(r['类别'], r['项目'], r.get('子目录', ''))}`"
+        return "读不了，没入库" if r["状态"] == STATUS_BLOCKED else "没有入库"
+    table("A. 先看这几条：AI 没把握的", "AI 看内容逐个判断的、两个项目打平的、放进待定的、疑似隐私没入库的、读不了的。",
+          "| 编号 | 文件 | 结果 | 理由 |",
+          [f"| A{i} | {esc(r['文件名'])} | {outcome(r)} | {esc(r['依据'])} |" for i, r in enumerate(a_rows, 1)])
+
+    # B 分类规则：规则判断（含你的规则）的复制/登记，按“依据第一段 + 类别”归组
+    groups: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    in_a = {id(r) for r in a_rows}
+    for r in files:
+        if r["状态"] in (STATUS_COPY, STATUS_REGISTER) and id(r) not in in_a:
+            groups[(norm_reason(r["依据"].split("；")[0]), r["类别"])].append(r)
+    body = []
+    for i, ((why, cat), rs) in enumerate(sorted(groups.items(), key=lambda kv: (kv[0][1], -len(kv[1]))), 1):
+        unsure = sum(1 for r in rs if r["置信度"] in ("中", "低")) > len(rs) / 2
+        where = CATEGORIES.get(cat, "").replace("{项目}", "<项目>")
+        body.append(f"| B{i} | {esc(why)} → **{cat}**{'（把握一般）' if unsure else ''} | {len(rs)} | `{where}` | {examples(rs)} |")
+    table("B. 分类规则", "按文件名、扩展名、DOI、照片拍摄信息和你的规则分的类。", "| 编号 | 规则 | 文件数 | 放到 | 例子 |", body)
+
+    # C 项目规则
+    pg: dict[str, list[dict]] = defaultdict(list)
+    for r in files:
+        if r["状态"] in (STATUS_COPY, STATUS_REGISTER):
+            pg[project_source(r)].append(r)
+    table("C. 项目规则", "文件属于哪个项目是怎么定的。", "| 编号 | 规则 | 文件数 | 例子 |",
+          [f"| C{i} | {esc(k)} | {len(rs)} | {examples(rs)} |"
+           for i, (k, rs) in enumerate(sorted(pg.items(), key=lambda kv: -len(kv[1])), 1)])
+
+    # D 不入库（AI 判断的和隐私文件已列在 A）
+    dg: dict[str, list[dict]] = defaultdict(list)
+    for r in rows:
+        if r["状态"] == STATUS_SKIP and not r["依据"].startswith("AI：") and PRIVACY_HOLD not in r["依据"]:
+            dg[norm_reason(r["依据"].split("；")[0])].append(r)
+    table("D. 不入库", "", "| 编号 | 原因 | 文件数 | 例子 |",
+          [f"| D{i} | {esc(k)} | {len(rs)} | {examples(rs)} |" for i, (k, rs) in enumerate(sorted(dg.items(), key=lambda kv: -len(kv[1])), 1)])
+
+    # E 版本、同名、改名
+    old = [r for r in files if r["状态"] == STATUS_COPY and (r.get("子目录") or "").startswith("历史版本")]
+    same = [r for r in files if r["状态"] == STATUS_COPY and "与其他文件同名" in r["依据"]]
+    ren = [r for r in files if r["状态"] == STATUS_COPY and r.get("入库名")]
+    body = []
+    if old:
+        body.append(f"| E{len(body) + 1} | 同一文件的多个版本：最新的留在原处，旧版放进 `历史版本/` | {len(old)} | {examples(old)} |")
+    if same:
+        body.append(f"| E{len(body) + 1} | 不同文件夹里的同名文件：各自保留来源文件夹名 | {len(same)} | {examples(same)} |")
+    if ren:
+        body.append(f"| E{len(body) + 1} | 看不出内容的文件名：改名入库（只改副本） | {len(ren)} | "
+                    + "、".join(f"{esc(r['文件名'])} → {esc(r['入库名'])}" for r in ren[:3]) + " |")
+    table("E. 版本、同名与改名", "", "| 编号 | 规则 | 文件数 | 例子 |", body)
+    return lines
+
+
+def write_rules_report(kb: Path, rows: list[dict], stamp: str, user_rules: list[dict]) -> None:
+    """只重写「最近一次整理用到的规则」这一节，「你的规则」原样保留。"""
+    path = kb / RULES_FILE
+    if path.exists():
+        text = path.read_text(encoding="utf-8")
+    else:
+        tpl = TEMPLATE_DIR / "root" / RULES_FILE
+        text = fill(tpl.read_text(encoding="utf-8"), {"日期": dt.date.today().isoformat()}) if tpl.exists() else f"# 整理规则\n\n## 你的规则（优先）\n\n| 匹配 | 看哪里 | 归为 | 项目 | 为什么 |\n|---|---|---|---|---|\n"
+    head = text.split(RULES_REPORT_HEAD)[0].rstrip() + "\n\n"
+    path.write_text(head + "\n".join(rules_report(rows, stamp, user_rules)) + "\n", encoding="utf-8")
+
+
+def relink_notes(kb: Path, moves: dict[str, str]) -> int:
+    """笔记里指向被挪走文件的 [[链接]] 跟着改，和 Obsidian 移动文件时的做法一样。返回改了几篇。"""
+    if not moves:
+        return 0
+    pat = re.compile(r"\[\[(" + "|".join(re.escape(o) for o in sorted(moves, key=len, reverse=True)) + r")(?=\\?\||\]\]|#)")
+    n = 0
+    for note in md_files(kb):
+        text = note.read_text(encoding="utf-8", errors="ignore")
+        new = pat.sub(lambda m: "[[" + moves[m.group(1)], text)
+        if new != text:
+            note.write_text(new, encoding="utf-8")
+            n += 1
+    return n
+
+
+def cmd_reorg(args: argparse.Namespace) -> None:
+    """按「你的规则」重新安排知识库里已入库的副本：改类别、改项目或移出知识库。原件不动。"""
+    kb = Path(args.kb).expanduser().resolve()
+    rules = read_user_rules(kb)
+    if not rules:
+        print(f"{RULES_FILE} 的「你的规则」里还没有规则，没有要挪的文件。", file=sys.stderr)
+        sys.exit(2)
+    manifest = load_manifest(kb)
+    ignored = load_ignored(kb)
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    moves: dict[str, str] = {}
+    removed, plans = [], []
+    for digest, m in sorted(manifest.items(), key=lambda kv: kv[1]["知识库路径"]):
+        src = Path(m["原路径"])
+        try:
+            src.relative_to(kb)
+            continue  # 用户手动放进知识库、只登记的文件，位置由用户定
+        except ValueError:
+            pass
+        rel = Path(m.get("来源相对路径") or Path(*src.parts[-3:]))
+        rule = apply_user_rule(rules, rel)
+        if not rule:
+            continue
+        cur = m["知识库路径"]
+        if rule["归为"] in SKIP_WORDS:
+            plans.append((digest, cur, None, rule))
+            continue
+        new_cat, new_proj = rule["归为"] or m["类别"], rule["项目"] or m["项目"]
+        if (new_cat, new_proj) == (m["类别"], m["项目"]):
+            continue
+        old_base = dest_dir(m["类别"], m["项目"])
+        rest = cur[len(old_base) + 1:] if cur.startswith(old_base + "/") else Path(cur).name
+        plans.append((digest, cur, f"{dest_dir(new_cat, new_proj)}/{rest}", rule))
+
+    if not plans:
+        print("规则和现在的位置一致，没有要挪的文件。")
+        return
+    for digest, cur, new, rule in plans:
+        m = manifest[digest]
+        label = f"规则 {rule['n']}"
+        if new is None:
+            print(f"{'[预演] ' if args.dry_run else ''}移出知识库（{label}）：{cur}")
+            if not args.dry_run:
+                bin_path = kb / ".kb" / "回收" / stamp / cur
+                bin_path.parent.mkdir(parents=True, exist_ok=True)
+                if (kb / cur).exists():
+                    shutil.move(str(kb / cur), bin_path)
+                del manifest[digest]
+                ignored[digest] = f"{Path(cur).name} · 你的规则 {rule['n']}：移出知识库"
+                removed.append(cur)
+            continue
+        target = kb / new
+        n = 2
+        while target.exists() and target != kb / cur:
+            target = target.with_name(f"{Path(new).stem} ({n}){Path(new).suffix}")
+            n += 1
+        new = target.relative_to(kb).as_posix()
+        print(f"{'[预演] ' if args.dry_run else ''}挪（{label}）：{cur} → {new}")
+        if not args.dry_run:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if (kb / cur).exists():
+                shutil.move(str(kb / cur), target)
+            m["知识库路径"], m["类别"], m["项目"] = new, rule["归为"] or m["类别"], rule["项目"] or m["项目"]
+            moves[cur] = new
+            moves[cur.removesuffix(".md")] = new.removesuffix(".md")
+    if args.dry_run:
+        print(f"[预演] 共 {len(plans)} 个文件，未改动任何文件。")
+        return
+
+    with (kb / ".kb" / "manifest.csv").open("w", encoding="utf-8-sig", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=MANIFEST_FIELDS)
+        w.writeheader()
+        for row in sorted(manifest.values(), key=lambda x: x["知识库路径"]):
+            w.writerow({k: row.get(k, "") for k in MANIFEST_FIELDS})
+    if removed:  # 移出的文件记进不入库清单：以后扫描不再入库，对账也认作“按规则移出”
+        with (kb / ".kb" / "ignored.csv").open("w", encoding="utf-8-sig", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["sha256", "原因"])
+            w.writerows(sorted(ignored.items()))
+    write_source_index(kb)
+    relinked = relink_notes(kb, {k: v for k, v in moves.items() if k != v})
+    moved = len(plans) - len(removed)
+    append_changelog(kb, f"**按整理规则重新整理**：挪了 {moved} 个副本，移出知识库 {len(removed)} 个"
+                         f"（放在 `.kb/回收/{stamp}/`，可恢复），更新了 {relinked} 篇笔记里的链接；原件未改动。", tag="整理")
+    print(f"挪了 {moved} 个，移出 {len(removed)} 个（在 .kb/回收/{stamp}/），更新了 {relinked} 篇笔记里的链接。原件未改动。")
 
 
 def cmd_verify(args: argparse.Namespace) -> None:
@@ -1512,7 +1834,8 @@ def strip_code(text: str) -> str:
     return re.sub(r"`[^`\n]*`", "", text)
 
 
-ROOT_ENTRIES = {"AGENTS.md", "CLAUDE.md", "知识库导航.md", "知识库说明.md", "知识库变更日志.md", "INBOX.md", "知识索引.md"}
+ROOT_ENTRIES = {"AGENTS.md", "CLAUDE.md", "知识库导航.md", "知识库说明.md", "知识库变更日志.md", "INBOX.md", "知识索引.md",
+                OUTLINE, RULES_FILE}
 CROWDED = 150
 
 
@@ -2228,6 +2551,11 @@ def main() -> None:
     v.add_argument("--kb", required=True, help="知识库路径")
     v.add_argument("--full", action="store_true", help="重新计算原件哈希（慢，但最彻底）")
     v.set_defaults(func=cmd_verify)
+
+    ro = sub.add_parser("reorg", help="按 整理规则.md「你的规则」重新安排知识库里的副本（改类别、改项目或移出），原件不动")
+    ro.add_argument("kb", help="知识库路径")
+    ro.add_argument("--dry-run", action="store_true", help="只列出要挪的文件，不改动")
+    ro.set_defaults(func=cmd_reorg)
 
     o = sub.add_parser("overview", help="按纲要生成项目总览草稿（【你定】照抄纲要，【AI 整理】从资料清单填）")
     o.add_argument("kb", help="知识库路径")
