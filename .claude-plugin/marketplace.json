@@ -1,0 +1,11 @@
+{
+  "name": "kb-starter",
+  "owner": { "name": "Lucas0ng" },
+  "plugins": [
+    {
+      "name": "kb-starter",
+      "source": "./",
+      "description": "一键把零散资料建成会自己生长的个人知识库"
+    }
+  ]
+}
