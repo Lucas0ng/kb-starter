@@ -1248,6 +1248,8 @@ def write_source_index(kb: Path) -> None:
 # 决定它在知识索引里怎么显示。“用于”写“什么时候该想起它”，AI 靠它把当前任务和过去的知识对上。
 
 CARD_DIRS = ("01_知识提炼", "02_方法论库")
+ADOPT_FILE = "adopt.csv"
+CARD_ROLES = {"知识", "方法"}
 TYPE_ORDER = ["概念", "决策", "问题", "教训", "SOP", "人物", "文献", "研究问题", "提示词", "其他"]
 FM_LINE_RE = re.compile(r"^([^\s:#\-][^:]*?):\s*(.*)$")
 DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
@@ -1304,36 +1306,111 @@ def project_of(fm: dict) -> str:
     return re.sub(r"(项目)?_总览$", "", v).strip()
 
 
-def knowledge_cards(kb: Path) -> list[dict]:
-    cards = []
-    for top in CARD_DIRS:
+TAGS_BLOCK_RE = re.compile(r"^tags:\s*(.*)$((?:\n[ \t]+-[^\n]*)*)", re.M)
+# 别人的库常把类型写成标签（类型/PaperCard、type/concept），这里对到 TYPE_ORDER
+TAG_TYPE_ALIASES = {
+    "papercard": "文献", "文献卡片": "文献", "文献": "文献", "paper": "文献", "literature": "文献",
+    "概念": "概念", "concept": "概念", "概念节点": "概念", "决策": "决策", "decision": "决策",
+    "问题": "问题", "problem": "问题", "教训": "教训", "lesson": "教训", "sop": "SOP", "howto": "SOP",
+    "人物": "人物", "person": "人物", "研究问题": "研究问题", "提示词": "提示词", "prompt": "提示词",
+}
+
+
+def read_tags(text: str) -> list[str]:
+    """frontmatter 里的 tags：列表写法和一行写法都认。"""
+    if not text.startswith("---"):
+        return []
+    end = text.find("\n---", 3)
+    m = TAGS_BLOCK_RE.search(text[:end if end != -1 else 0])
+    if not m:
+        return []
+    inline = m.group(1).strip().strip("[]")
+    items = re.split(r"[,，\s]+", inline) if inline else []
+    items += [line.strip()[1:].strip() for line in m.group(2).splitlines() if line.strip()]
+    return [t.strip("'\"#") for t in items if t.strip("'\"#")]
+
+
+def tag_value(tags: list[str], *keys: str) -> str:
+    for t in tags:
+        head, _, tail = t.partition("/")
+        if tail and head.lower() in keys:
+            return tail
+    return ""
+
+
+def adopt_map(kb: Path) -> dict[str, dict]:
+    """接入已有知识库时确认过的映射：目录 → {角色, 项目}。没有就返回空。"""
+    path = kb / ".kb" / ADOPT_FILE
+    if not path.exists():
+        return {}
+    return {r["目录"].strip("/"): r for r in read_csv_rows(path, "接入映射 adopt.csv ", ("目录", "角色"))}
+
+
+def card_roots(kb: Path, mapping: dict[str, dict] | None = None) -> tuple[list[str], set[str]]:
+    """返回 (卡片所在的目录, 要剪掉的子目录)。有接入映射就按映射，没有就是 kb-starter 的分层。"""
+    mapping = adopt_map(kb) if mapping is None else mapping
+    if not mapping:
+        return list(CARD_DIRS), set()
+    roots = sorted(d for d, r in mapping.items() if r.get("角色") in CARD_ROLES)
+    prune = {d for d, r in mapping.items() if r.get("角色") not in CARD_ROLES}
+    return roots, prune
+
+
+def knowledge_cards(kb: Path, mapping: dict[str, dict] | None = None, skip_private: bool = False) -> list[dict]:
+    cards, seen = [], set()
+    mapping = adopt_map(kb) if mapping is None else mapping
+    # 接入的库里是用户自己的旧笔记，没人确认过隐私：文件名像隐私资料的不读、不进索引（索引还会进粘贴包）
+    skip_private = skip_private or bool(mapping)
+    roots, prune = card_roots(kb, mapping)
+    projects = {d: r.get("项目", "") for d, r in mapping.items()}
+    for top in roots:
         base = kb / top
         if not base.exists():
             continue
         for root, dirs, files in os.walk(base):
-            dirs[:] = sorted(d for d in dirs if not d.startswith(".") and not is_archive_dir(d) and d != "写作模板")
+            rel_root = Path(root).relative_to(kb).as_posix()
+            dirs[:] = sorted(d for d in dirs if not d.startswith(".") and not is_archive_dir(d) and d != "写作模板"
+                             and f"{rel_root}/{d}" not in prune)
             for fn in sorted(files):
                 if not fn.endswith(".md") or fn.startswith("."):
                     continue
                 p = Path(root) / fn
                 rel = p.relative_to(kb)
+                if rel in seen or (skip_private and kw_hits(fn, "隐私")):
+                    continue
+                seen.add(rel)
                 text = p.read_text(encoding="utf-8", errors="ignore")
                 fm = read_frontmatter(text)
+                tags = read_tags(text)
+                if not fm.get("类型"):
+                    t = tag_value(tags, "类型", "type")
+                    fm["类型"] = TAG_TYPE_ALIASES.get(t.lower(), t if t in TYPE_ORDER else "")
+                proj = project_of(fm) or tag_value(tags, "项目", "project")
+                if not proj:  # 映射里给目录定了项目的，目录下的笔记都算这个项目
+                    proj = next((projects[d] for d in sorted(projects, key=len, reverse=True)
+                                 if projects[d] and rel.as_posix().startswith(d + "/")), "")
                 st = p.stat()
                 created = fm.get("创建", "")[:10]
                 if not DATE_RE.fullmatch(created):
                     created = dt.date.fromtimestamp(getattr(st, "st_birthtime", st.st_mtime)).isoformat()
                 cards.append({
                     "path": rel.as_posix(), "name": p.stem, "type": infer_type(rel, fm),
-                    "one": fm.get("一句话", ""), "use": fm.get("用于", ""), "project": project_of(fm),
+                    "one": fm.get("一句话", "") or fm.get("description", "") or fm.get("summary", ""),
+                    "use": fm.get("用于", ""), "project": proj,
                     "source": fm.get("来源", "") or fm.get("原文", ""), "created": created,
                     "mtime": st.st_mtime, "text": text,
                 })
     return cards
 
 
+SUMMARY_HEAD_RE = re.compile(r"^#{1,4}\s*(?:\d+[\s.、]*)?(一句话|核心结论|结论|摘要|TL;?DR|Summary)[^\n]*$", re.M | re.I)
+
+
 def fallback_summary(text: str, limit: int = 60) -> str:
-    s = first_paragraph(text, limit)
+    """卡片头部没写「一句话」时的兜底：先找“一句话 / 核心结论 / 摘要”这类小节，再用正文第一段。"""
+    m = SUMMARY_HEAD_RE.search(body_of(text))
+    s = first_paragraph(body_of(text)[m.end():], limit) if m else ""
+    s = s or first_paragraph(text, limit)
     return re.sub(r"^(一句话|核心概念|一句话结论|用途|这是什么)\s*[:：]?\s*", "", s)
 
 
@@ -1546,12 +1623,12 @@ def cmd_apply(args: argparse.Namespace) -> None:
         print("这些条目的项目、子目录或入库名不安全，没有写入任何文件（纲要或整理规则里的项目名也要改）：\n  "
               + "\n  ".join(unsafe), file=sys.stderr)
         sys.exit(2)
-    # 已有内容、又不是 kb-starter 建的文件夹：不能悄悄塞进骨架，要用户同意并入
-    if not args.merge and kb.is_dir() and not (kb / ".kb").exists():
-        others = sorted(p.name for p in kb.iterdir() if p.name != OUTLINE and p.name.lower() not in JUNK_NAMES)
+    # 已有内容、又没经 kb-starter 入库过的文件夹（包括只 adopt 过的）：不能悄悄塞进骨架，要用户同意并入
+    if not args.merge and kb.is_dir() and not (kb / ".kb" / "manifest.csv").exists():
+        others = sorted(p.name for p in kb.iterdir() if p.name not in (OUTLINE, ".kb") and p.name.lower() not in JUNK_NAMES)
         if others:
             shown = "、".join(others[:5]) + (f" 等 {len(others)} 项" if len(others) > 5 else "")
-            print(f"知识库文件夹里已经有内容（{shown}），但它不是 kb-starter 建的库（没有 .kb/）：{kb}\n"
+            print(f"知识库文件夹里已经有内容（{shown}），但它不是 kb-starter 建的库（没有 .kb/manifest.csv）：{kb}\n"
                   "先问用户是并入这个文件夹，还是另建一个。用户同意并入后加 --merge 重新运行（已有文件不会被覆盖）。",
                   file=sys.stderr)
             sys.exit(2)
@@ -2568,6 +2645,415 @@ def cmd_overview(args: argparse.Namespace) -> None:
         print(f"{p['name']}：{len(files)} 个文件 → {target.relative_to(kb)}{where}")
 
 
+# ---------------------------------------------------------------- 接入已有知识库 adopt
+#
+# 已有的笔记库（Obsidian、PARA、日记库、kb-starter 早期版本……）不搬家也能用：只读盘点每个目录，
+# 建议它在 kb-starter 里扮演什么角色，按建议原地生成知识索引草稿。用户确认映射后，--write 只写
+# .kb/adopt.csv 和 知识索引.md，不移动、不改动任何已有文件。
+
+ADOPT_ROLES = {
+    "原始资料": "输入材料（文献、实验记录、会议、剪藏、课程）：原地保留，以后可以登记或复制进 00_原始资料/",
+    "知识": "知识笔记：进入知识索引",
+    "方法": "方法、SOP、提示词：进入知识索引",
+    "产出": "成品（论文稿、报告、PPT）：项目总览里列现行文件，不进索引",
+    "复盘": "日记、周报、复盘、日志",
+    "模板": "笔记模板，不进索引",
+    "附件": "图片等附件，原地不动",
+    "工作区": "代码、临时文件、过程文件",
+    "归档": "旧版本、备份，不进索引",
+    "忽略": "不盘点（Obsidian 已排除）",
+    "待定": "看不出来，请用户定",
+}
+ADOPT_FIELDS = ["目录", "角色", "项目", "笔记数", "其他文件数", "涉及项目", "依据", "置信度"]
+KB_PREFIX_ROLES = {"00": "原始资料", "01": "知识", "02": "方法", "03": "产出", "04": "复盘", "99": "工作区"}
+# 按顺序匹配，先中先得：结构性角色（归档、模板、附件、工作区）优先于内容角色
+ADOPT_NAME_RULES = [
+    ("归档", ["archive", "archives", "归档", "历史", "backup", "备份", "旧版", "old", "trash", "废纸篓"]),
+    ("模板", ["template", "templates", "模板"]),
+    ("附件", ["attachment", "attachments", "assets", "附件", "images", "image", "img", "media", "pictures", "图片"]),
+    ("工作区", ["工作区", "workspace", "tmp", "temp", "scripts", "code", "build", "dist"]),
+    ("复盘", ["日记", "daily", "journal", "journals", "周报", "weekly", "复盘", "review", "reviews", "日志", "periodic"]),
+    ("方法", ["方法", "sop", "流程", "方案", "规范", "prompt", "prompts", "提示词", "howto", "playbook", "checklist"]),
+    ("产出", ["输出", "output", "outputs", "产出", "草稿", "drafts", "draft", "报告", "reports", "汇报", "ppt",
+             "slides", "发表", "publish", "manuscript"]),
+    ("原始资料", ["原始", "资料", "文献", "papers", "literature", "references", "剪藏", "clippings", "clip", "收集",
+               "inbox", "下载", "downloads", "课程", "course", "courses", "lecture", "会议", "meeting", "meetings",
+               "实验记录", "raw", "sources", "readwise", "kindle", "highlights"]),
+    ("知识", ["知识", "笔记", "notes", "卡片", "cards", "zettel", "zettelkasten", "概念", "concepts", "提炼", "wiki",
+            "permanent", "evergreen", "领域", "areas", "area", "resources", "topics", "主题", "moc", "maps", "学习"]),
+]
+STRUCTURAL_ROLES = {"归档", "模板", "附件", "工作区"}
+CONTAINER_NAMES = {"projects", "project", "项目", "课题"}
+DATED_NOTE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
+ENTRY_NAMES = {"agents.md", "claude.md", "readme.md", "index.md", "home.md", "inbox.md"}
+
+
+def adopt_family(p: Path) -> str:
+    ext = p.suffix.lower()
+    if ext in (".md", ".markdown", ".canvas", ".base"):
+        return "笔记"
+    if ext in EXT["pdf"] | EXT["doc"] | EXT["ppt"] | EXT["web"] | EXT["biblio"] | EXT["tex"] | {".txt"}:
+        return "文档"
+    if ext in EXT["sheet"] | EXT["instrument"]:
+        return "数据"
+    if ext in EXT["image"]:
+        return "图片"
+    if ext in EXT["audio"] | EXT["video"]:
+        return "音视频"
+    if ext in EXT["code"] | {".json", ".yaml", ".yml", ".toml", ".lock", ".css", ".map", ".mjs", ".cjs"}:
+        return "代码"
+    return "其他"
+
+
+def name_role(name: str, top: bool) -> tuple[str, str, bool]:
+    """按目录名判断角色，返回 (角色, 依据, 是否项目容器)。判断不了时角色为空。"""
+    if top:
+        m = re.match(r"^(\d{2})_", name)
+        if m and m.group(1) in KB_PREFIX_ROLES:
+            return KB_PREFIX_ROLES[m.group(1)], f"kb-starter 分层编号 {m.group(1)}_", False
+    core = re.sub(r"^\d+[\s._-]*", "", name).strip().lower()  # “1 Projects”“01_文献”这类编号先去掉
+    if core in CONTAINER_NAMES:
+        return "", "目录名像项目文件夹，子文件夹按项目分", True
+    tokens = set(re.split(r"[^a-z0-9]+", core)) - {""}
+    for role, words in ADOPT_NAME_RULES:
+        for w in words:
+            if (w.isascii() and w in tokens) or (not w.isascii() and w in core):
+                return role, f"目录名含「{w}」", False
+    return "", "", False
+
+
+def composition_role(c: Counter, dated: int) -> tuple[str, str, str]:
+    """按目录里的文件构成判断角色，返回 (角色, 依据, 置信度)。"""
+    total = sum(c.values())
+    if not total:
+        return "", "", ""
+    notes = c["笔记"]
+    share = {k: c[k] / total for k in c}
+    if notes >= 5 and dated >= 0.5 * notes:
+        return "复盘", f"{dated}/{notes} 篇笔记以日期命名", "中"
+    if share.get("笔记", 0) >= 0.7:
+        return "知识", f"笔记占 {share['笔记']:.0%}", "中"
+    if share.get("代码", 0) >= 0.5:
+        return "工作区", f"代码文件占 {share['代码']:.0%}", "中"
+    if share.get("图片", 0) >= 0.7:
+        return "附件", f"图片占 {share['图片']:.0%}", "中"
+    raw = share.get("文档", 0) + share.get("数据", 0) + share.get("音视频", 0)
+    if raw >= 0.6:
+        return "原始资料", f"文档、数据和音视频占 {raw:.0%}", "中"
+    return "待定", "笔记和其他文件混在一起，看不出用途", "低"
+
+
+def obsidian_ignores(kb: Path) -> list[str]:
+    try:
+        cfg = json.loads((kb / ".obsidian" / "app.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    return [f.strip("/") for f in cfg.get("userIgnoreFilters", []) if isinstance(f, str) and not f.startswith("/")]
+
+
+def norm_project(name: str) -> str:
+    name = re.sub(r"[\[\]\"']", "", name or "").strip()
+    return re.sub(r"[_\s]*(项目)?[_\s]*总览$|项目$", "", name).strip() or name
+
+
+def adopt_survey(kb: Path) -> dict:
+    """只读盘点：每个一、二级目录的文件构成，项目线索，根目录入口。不打开任何非 Markdown 文件。"""
+    ignores = obsidian_ignores(kb)
+    stats: dict[str, Counter] = defaultdict(Counter)
+    dated: Counter = Counter()
+    proj_files: dict[str, Counter] = defaultdict(Counter)
+    tag_projects: Counter = Counter()
+    private_notes: list[str] = []
+    hidden: list[tuple[str, int]] = []
+    ignored_rows: list[tuple[str, int]] = []
+    root_files: list[str] = []
+    note_projects: list[tuple[str, str]] = []  # (相对路径, 项目)
+    direct: Counter = Counter()  # 一级目录下直接放的文件数（不算子文件夹里的）
+    total = Counter()
+    size = latest = 0
+
+    def ignored(rel: str) -> bool:
+        return any(rel == f or rel.startswith(f + "/") for f in ignores)
+
+    for root, dirs, names in os.walk(kb, onerror=lambda e: None):
+        rp = Path(root)
+        rel_root = rp.relative_to(kb).as_posix()
+        keep = []
+        for d in sorted(dirs):
+            rel = d if rel_root == "." else f"{rel_root}/{d}"
+            if d.startswith(".") or d in SKIP_DIRS:
+                if rel_root == "." and d not in (".obsidian", ".trash", ".git"):
+                    hidden.append((d, count_files(rp / d)[0]))
+                continue
+            if ignored(rel):
+                if rel.count("/") <= 1:
+                    ignored_rows.append((rel, count_files(rp / d)[0]))
+                continue
+            keep.append(d)
+        dirs[:] = keep
+        for fn in sorted(names):
+            if fn.startswith(".") or fn.lower() in JUNK_NAMES:
+                continue
+            p = rp / fn
+            rel = p.relative_to(kb)
+            st = stat_quiet(p)
+            fam = adopt_family(p)
+            total[fam] += 1
+            if st:
+                size += st.st_size
+                latest = max(latest, st.st_mtime)
+            if len(rel.parts) == 1:
+                root_files.append(fn)
+            elif len(rel.parts) == 2:
+                direct[rel.parts[0]] += 1
+            in_archive = any(is_archive_dir(x) for x in rel.parts[1:-1])
+            keys = [rel.parts[0]] if len(rel.parts) > 1 else []
+            if len(rel.parts) > 2:
+                keys.append("/".join(rel.parts[:2]))
+            for k in keys:
+                stats[k]["归档内" if in_archive else fam] += 1
+                if fam == "笔记" and DATED_NOTE_RE.match(fn) and not in_archive:
+                    dated[k] += 1
+            if fam == "笔记" and fn.endswith(".md"):
+                if kw_hits(fn, "隐私"):
+                    private_notes.append(rel.as_posix())
+                    continue
+                try:
+                    with p.open(encoding="utf-8", errors="ignore") as f:
+                        head = f.read(4000)
+                except OSError:
+                    continue
+                proj = norm_project(project_of(read_frontmatter(head)) or tag_value(read_tags(head), "项目", "project"))
+                if proj:
+                    tag_projects[proj] += 1
+                    note_projects.append((rel.as_posix(), proj))
+
+    overviews = sorted(f for f in root_files if f.endswith("_总览.md"))
+    projects = {norm_project(Path(f).stem): {"总览": f, "笔记": 0} for f in overviews}
+    for name, n in tag_projects.items():
+        projects.setdefault(name, {"总览": "", "笔记": 0})["笔记"] = n
+    # 每个目录涉及哪些项目：笔记看头部，其他文件看路径里有没有项目名
+    for path, proj in note_projects:
+        parts = path.split("/")
+        for k in ([parts[0]] if len(parts) > 1 else []) + (["/".join(parts[:2])] if len(parts) > 2 else []):
+            proj_files[k][proj] += 1
+    names = sorted((p for p in projects if len(p) >= 2), key=len, reverse=True)
+    for root, dirs, files in os.walk(kb, onerror=lambda e: None):
+        rel_root = Path(root).relative_to(kb).as_posix()
+        dirs[:] = [d for d in dirs if not d.startswith(".") and d not in SKIP_DIRS
+                   and not ignored(d if rel_root == "." else f"{rel_root}/{d}")]
+        if rel_root == ".":
+            continue
+        parts = rel_root.split("/")
+        hit = next((p for p in names if p in rel_root), "")
+        if not hit:
+            continue
+        n = sum(1 for f in files if not f.endswith(".md") and not f.startswith("."))
+        for k in [parts[0]] + (["/".join(parts[:2])] if len(parts) > 1 else []):
+            proj_files[k][hit] += n
+    return {"stats": stats, "dated": dated, "proj_files": proj_files, "projects": projects, "ignores": ignores,
+            "direct": direct,
+            "ignored_rows": ignored_rows, "hidden": hidden, "root_files": root_files, "overviews": overviews,
+            "private_notes": private_notes, "total": total, "size": size, "latest": latest}
+
+
+def adopt_rows(kb: Path, sv: dict) -> list[dict]:
+    """给每个一、二级目录一个建议角色。子目录默认继承父目录的内容角色，只有结构性角色（归档、模板等）能覆盖。"""
+    stats, dated, proj_files = sv["stats"], sv["dated"], sv["proj_files"]
+    project_names = sorted((p for p in sv["projects"] if len(p) >= 2), key=len, reverse=True)
+    rows = []
+
+    def make(key: str, role: str, why: str, conf: str, project: str = "") -> dict:
+        c = stats.get(key, Counter())
+        notes = c["笔记"]
+        involved = "、".join(f"{p} {n}" for p, n in proj_files.get(key, Counter()).most_common(3))
+        # 目录名里出现已识别的项目名时用它（“电解液课题”→“电解液”），否则用调用方给的（子文件夹名）
+        project = next((p for p in project_names if p in key.split("/")[-1]), "") or project
+        return {"目录": key, "角色": role, "项目": project, "笔记数": str(notes),
+                "其他文件数": str(sum(c.values()) - notes), "涉及项目": involved, "依据": why, "置信度": conf}
+
+    for rel, n in sv["ignored_rows"]:
+        rows.append({"目录": rel, "角色": "忽略", "项目": "", "笔记数": "", "其他文件数": str(n), "涉及项目": "",
+                     "依据": "Obsidian 设置里已排除", "置信度": "高"})
+    tops = sorted(k for k in stats if "/" not in k)
+    for top in tops:
+        role, why, container = name_role(top, top=True)
+        conf = "高" if role else ""
+        if container:  # 项目文件夹本来就是笔记和文件混放：笔记进索引，其他文件原地保留
+            role, why, conf = "知识", why + "；笔记进索引，其他文件原地保留", "中"
+        # 非 kb-starter 编号的目录，下面只有子文件夹、没有直接放的文件：子文件夹多半是一个个主题（学习/某门课、Areas/某领域）
+        topical = (not re.match(r"^\d{2}_", top) and not container and role not in STRUCTURAL_ROLES
+                   and not sv["direct"].get(top) and any(k.startswith(top + "/") for k in stats))
+        if not role:
+            role, why2, conf = composition_role(stats[top], dated[top])
+            why = f"{why}；{why2}" if why else why2
+        if not role:
+            continue
+        rows.append(make(top, role, why, conf))
+        for key in sorted(k for k in stats if k.startswith(top + "/") and k.count("/") == 1):
+            child = key.split("/")[1]
+            crole, cwhy, _ = name_role(child, top=False)
+            if container:  # 项目容器：每个子文件夹是一个项目；构成说不清（笔记和文件混放）时仍算知识
+                r2, w2, c2 = composition_role(stats[key], dated[key])
+                if crole in STRUCTURAL_ROLES:
+                    r2, w2, c2 = crole, cwhy, "高"
+                elif r2 in ("待定", ""):
+                    r2, w2, c2 = role, w2 or "空文件夹", conf
+                rows.append(make(key, r2, f"项目文件夹；{w2}", c2, project="" if crole else child))
+            elif crole in STRUCTURAL_ROLES or role in ("待定", "") or (crole and role in STRUCTURAL_ROLES):
+                if crole:
+                    rows.append(make(key, crole, cwhy, "高"))
+                else:
+                    r2, w2, c2 = composition_role(stats[key], dated[key])
+                    rows.append(make(key, r2 or role, w2, c2 or "低"))
+            elif crole and crole != role and composition_role(stats[key], dated[key])[0] == crole:
+                # 名字和文件构成都指向另一个角色（Resources/Papers 里全是 PDF）才覆盖上级；
+                # 只有名字像（“文献概念梳理”里其实全是笔记）就仍随上级
+                rows.append(make(key, crole, f"{cwhy}；{composition_role(stats[key], dated[key])[1]}", "中",
+                                 project=child if topical else ""))
+            else:
+                rows.append(make(key, role, f"随上级「{top}」" + ("；子文件夹按主题分，当一个项目" if topical else ""),
+                                 conf, project=child if topical and not crole else ""))
+    return sorted(rows, key=lambda r: r["目录"])
+
+
+def adopt_report(kb: Path, sv: dict, rows: list[dict], cards: list[dict], out: Path, index_chars: int) -> str:
+    t = sv["total"]
+    files = sum(t.values())
+    lines = [
+        f"# 接入盘点：{kb.name}", "",
+        f"> 只读盘点，没有改动知识库里的任何文件。生成于 {dt.datetime.now():%Y-%m-%d %H:%M}。", "",
+        "## 1. 概况", "",
+        f"- 路径：`{kb}`",
+        f"- 文件 {files} 个：" + "，".join(f"{k} {v}" for k, v in t.most_common()) + f"；共 {sv['size'] / 1e6:.0f} MB",
+        f"- 最近修改：{dt.datetime.fromtimestamp(sv['latest']):%Y-%m-%d}" if sv["latest"] else "- 最近修改：无",
+    ]
+    if sv["ignores"]:
+        lines.append(f"- Obsidian 已排除：{'、'.join(sv['ignores'])}（按“忽略”处理，不盘点内容）")
+    if sv["hidden"]:
+        lines.append("- 隐藏文件夹（没有盘点）：" + "、".join(f"{d}（{n} 个文件）" for d, n in sv["hidden"]))
+    existing = [f for f in sv["root_files"] if f in (OUTLINE, "知识索引.md", "AGENTS.md", "CLAUDE.md")]
+    lines.append(f"- 已有入口和规则文件：{'、'.join(existing) if existing else '无'}"
+                 + ("；已有 `.kb/`（kb-starter 建过或接入过）" if (kb / ".kb").exists() else ""))
+
+    lines += ["", f"## 2. 识别到的项目（{len(sv['projects'])}）", "",
+              "> 来自根目录的 `*_总览.md`，以及笔记头部的「项目 / 关联项目」和 `项目/…` 标签。起草纲要时以这里为准。", "",
+              "| 项目 | 总览 | 标了这个项目的笔记 |", "|---|---|---|"]
+    for name, p in sorted(sv["projects"].items(), key=lambda kv: (-kv[1]["笔记"], kv[0])):
+        lines.append(f"| {name} | {p['总览'] or '—'} | {p['笔记']} |")
+
+    lines += ["", "## 3. 目录映射建议", "",
+              "> 每个目录在 kb-starter 里扮演什么角色。**不会移动任何文件**，只决定哪些笔记进知识索引、总览里列哪些成品。"
+              "要改就改同目录的 `adopt_map.csv` 里的「角色」「项目」两列。角色只能是："
+              + "、".join(ADOPT_ROLES) + "。", "",
+              "| 目录 | 建议角色 | 项目 | 笔记 / 其他文件 | 涉及项目 | 依据 | 把握 |", "|---|---|---|---|---|---|---|"]
+    for r in rows:
+        lines.append(f"| `{r['目录']}` | **{r['角色']}** | {r['项目'] or ''} | {r['笔记数'] or '—'} / {r['其他文件数']} "
+                     f"| {r['涉及项目']} | {r['依据']} | {r['置信度']} |")
+    unsure = [r for r in rows if r["置信度"] in ("低", "") or r["角色"] == "待定"]
+    if unsure:
+        lines += ["", "请重点看：" + "、".join(f"`{r['目录']}`" for r in unsure) + "（把握低或待定）。"]
+
+    root_md = [f for f in sv["root_files"] if f.endswith(".md")]
+    lines += ["", "## 4. 根目录", "",
+              f"- 项目总览：{'、'.join(sv['overviews']) or '无'}",
+              f"- 其他笔记：{'、'.join(f for f in root_md if f not in sv['overviews']) or '无'}",
+              f"- 其他文件：{len(sv['root_files']) - len(root_md)} 个"]
+
+    types = Counter(c["type"] for c in cards)
+    missing = sum(1 for c in cards if c["type"] not in ("研究问题", "提示词") and (not c["one"] or not c["use"]))
+    lines += ["", "## 5. 原地索引预览", "",
+              f"- 按上面的映射，角色为「知识」「方法」的目录里有 **{len(cards)}** 篇笔记会进知识索引："
+              + "，".join(f"{k} {types[k]}" for k in TYPE_ORDER if types[k]),
+              f"- 草稿：`{out / '知识索引-草稿.md'}`（{index_chars} 字）",
+              f"- {missing} 篇缺「一句话」或「用于」，索引里只能显示正文第一段；以后打开时补上，AI 才容易想起它们。"]
+    if sv["private_notes"]:
+        lines.append(f"- 文件名像隐私资料的 {len(sv['private_notes'])} 篇笔记没有读取，也不进草稿："
+                     + "、".join(f"`{p}`" for p in sv["private_notes"][:10]))
+
+    raw_dirs = [r["目录"] for r in rows if r["角色"] == "原始资料"]
+    lines += ["", "## 6. 下一步", "",
+              "1. 用户看第 2、3 节，说哪里不对；改 `adopt_map.csv` 的「角色」「项目」。",
+              f"2. 确认后写入（只写 `.kb/{ADOPT_FILE}` 和 `知识索引.md`，不移动文件）：`KB adopt {kb} --out {out} "
+              f"--map {out / 'adopt_map.csv'} --write`",
+              f"3. 没有 `{OUTLINE}` 时，按 SKILL.md 建库第 2 步从第 2 节的项目和各项目总览起草一份。",
+              "4. 接入后，知识索引、体检（lint）、缺口（gaps）、增长统计（stats）、粘贴包（pack）都按映射工作。"
+              "**暂时不要在接入的库上运行 `apply`**：它会补上 kb-starter 的骨架、模板和整理规则，"
+              "变更日志也会按 kb-starter 的格式追加；原始资料（"
+              + ("、".join(f"`{d}`" for d in raw_dirs[:4]) or "无") + "）先原地保留。"]
+    return "\n".join(lines) + "\n"
+
+
+def cmd_adopt(args: argparse.Namespace) -> None:
+    kb = Path(args.kb).expanduser().resolve()
+    out = Path(args.out).expanduser().resolve()
+    if not kb.is_dir():
+        print(f"找不到知识库文件夹：{kb}", file=sys.stderr)
+        sys.exit(2)
+    if inside(kb, out) and not args.write:
+        print(f"--out 不能放在知识库里面（盘点是只读的）：{out}", file=sys.stderr)
+        sys.exit(2)
+
+    if args.write:
+        if not args.map:
+            print("--write 需要 --map：先只读盘点，用户确认 adopt_map.csv 之后再写入。", file=sys.stderr)
+            sys.exit(2)
+        rows = read_csv_rows(Path(args.map).expanduser(), "映射表", ("目录", "角色"))
+        errors = []
+        for r in rows:
+            d = r["目录"].strip().strip("/")
+            if r["角色"] not in ADOPT_ROLES:
+                errors.append(f"`{d}` 的角色「{r['角色']}」不在可选角色里：{'、'.join(ADOPT_ROLES)}")
+            if unsafe_name(r.get("项目", "")) or unsafe_name(d, multi=True):
+                errors.append(f"`{d}`：{unsafe_name(r.get('项目', '')) or unsafe_name(d, multi=True)}")
+            elif not (kb / d).is_dir():
+                errors.append(f"`{d}` 不是知识库里的文件夹")
+        if errors:
+            print("映射表有问题，没有写入：\n  " + "\n  ".join(errors), file=sys.stderr)
+            sys.exit(2)
+        index = kb / "知识索引.md"
+        if index.exists() and "由 `kb.py index` 自动生成" not in index.read_text(encoding="utf-8", errors="ignore") \
+                and not args.force:
+            print(f"知识库里已经有一份不是本工具生成的 知识索引.md，没有覆盖。改名或确认可以覆盖后加 --force：{index}",
+                  file=sys.stderr)
+            sys.exit(2)
+        (kb / ".kb").mkdir(exist_ok=True)
+        with (kb / ".kb" / ADOPT_FILE).open("w", encoding="utf-8-sig", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=["目录", "角色", "项目", "依据"])
+            w.writeheader()
+            for r in rows:
+                w.writerow({"目录": r["目录"].strip().strip("/"), "角色": r["角色"], "项目": r.get("项目", ""),
+                            "依据": r.get("依据", "")})
+        res = write_index(kb)
+        roles = Counter(r["角色"] for r in rows)
+        print(f"已写入 .kb/{ADOPT_FILE}（{len(rows)} 个目录：" + "，".join(f"{k} {v}" for k, v in roles.most_common()) + "）")
+        print(f"已生成 {res['path']}：{len(res['cards'])} 张卡片。没有移动或改动任何已有文件。")
+        print(f"建议在变更日志记一行：[整理] 接入 kb-starter：确认目录映射（.kb/{ADOPT_FILE}），原地生成 [[知识索引]]，未移动文件。")
+        return
+
+    out.mkdir(parents=True, exist_ok=True)
+    sv = adopt_survey(kb)
+    rows = adopt_rows(kb, sv)
+    mapping = {r["目录"]: r for r in rows}
+    cards = knowledge_cards(kb, mapping, skip_private=True)
+    text = build_index(kb, cards, compact=False)
+    if len(text) > 12000:
+        text = build_index(kb, cards, compact=True)
+    (out / "知识索引-草稿.md").write_text(text, encoding="utf-8")
+    with (out / "adopt_map.csv").open("w", encoding="utf-8-sig", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=ADOPT_FIELDS)
+        w.writeheader()
+        w.writerows(rows)
+    report = adopt_report(kb, sv, rows, cards, out, len(text))
+    (out / "adopt.md").write_text(report, encoding="utf-8")
+    roles = Counter(r["角色"] for r in rows if "/" not in r["目录"])
+    print(f"只读盘点完成，知识库没有任何改动。报告：{out / 'adopt.md'}")
+    print(f"一级目录 {sum(roles.values())} 个：" + "，".join(f"{k} {v}" for k, v in roles.most_common()))
+    print(f"项目 {len(sv['projects'])} 个：" + "、".join(sv["projects"]))
+    print(f"原地索引草稿：{len(cards)} 篇笔记 → {out / '知识索引-草稿.md'}")
+    print(f"映射表：{out / 'adopt_map.csv'}（用户确认后加 --map 和 --write 写入）")
+
+
 # ---------------------------------------------------------------- pack
 
 def body_of(text: str) -> str:
@@ -2712,6 +3198,14 @@ def main() -> None:
     l.add_argument("--min-notes", type=int, default=3, help="候选概念至少出现在几篇笔记（默认 3）")
     l.add_argument("--out", help="写入文件而不是打印")
     l.set_defaults(func=cmd_lint)
+
+    ad = sub.add_parser("adopt", help="接入已有知识库：只读盘点、目录映射建议、原地索引草稿；确认后 --write 只写映射和知识索引")
+    ad.add_argument("kb", help="已有知识库（例如 Obsidian vault）")
+    ad.add_argument("--out", required=True, help="盘点报告、映射表、索引草稿的输出目录（放在知识库外）")
+    ad.add_argument("--map", help="用户确认过的 adopt_map.csv（--write 时必填）")
+    ad.add_argument("--write", action="store_true", help="写入 .kb/adopt.csv 和 知识索引.md；不移动任何文件")
+    ad.add_argument("--force", action="store_true", help="已有不是本工具生成的 知识索引.md 时也覆盖")
+    ad.set_defaults(func=cmd_adopt)
 
     k = sub.add_parser("pack", help="生成给网页版 AI 的粘贴包")
     k.add_argument("kb", help="知识库路径")

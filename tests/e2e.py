@@ -197,6 +197,101 @@ def safety_regressions(base: Path) -> None:
     check("只有纲要的文件夹算空文件夹，不需要 --merge", p.returncode == 0, p.stderr.strip()[-150:])
 
 
+def adopt_tests(base: Path) -> None:
+    """接入已有知识库：一个 PARA 风格的 Obsidian 库，只读盘点 → 确认映射 → 原地索引。"""
+    sys.path.insert(0, str(HERE))
+    from make_fixtures import pdf
+
+    print("\n接入已有知识库（adopt）")
+    root = base / "adopt"
+    shutil.rmtree(root, ignore_errors=True)
+    v = root / "vault"
+
+    def note(rel: str, body: str, tags: tuple[str, ...] = ()) -> None:
+        p = v / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        fm = "---\ntags:\n" + "".join(f"  - {t}\n" for t in tags) + "---\n\n" if tags else ""
+        p.write_text(fm + body, encoding="utf-8")
+
+    (v / ".obsidian").mkdir(parents=True)
+    (v / ".obsidian" / "app.json").write_text(json.dumps({"userIgnoreFilters": ["Scratch/"]}), encoding="utf-8")
+    note("电解液_总览.md", "# 电解液 · 总览\n\n当前在做添加剂筛选。\n")
+    note("README.md", "# 我的库\n\n随便写写。\n")
+    note("1 Projects/电解液课题/添加剂筛选思路.md", "# 添加剂筛选思路\n\n先看 LiPF6 体系的稳定性。\n",
+         ("项目/电解液", "类型/概念"))
+    note("1 Projects/电解液课题/组会要点.md", "# 组会要点\n\n周三组会定了三组对照。\n", ("项目/电解液",))
+    pdf(v / "1 Projects/电解液课题/方案原稿.pdf", ["draft plan"])
+    note("2 Areas/健康/睡眠.md", "# 睡眠\n\n每天 7 小时。\n")
+    note("2 Areas/健康/体检报告2025.md", "# 体检\n\n肝功能异常，建议复查。\n")
+    (v / "3 Resources/Papers").mkdir(parents=True)
+    for i in range(3):
+        pdf(v / f"3 Resources/Papers/paper{i}.pdf", [f"Paper {i}", f"doi:10.1000/xyz{i}"])
+    note("3 Resources/读书笔记/思考快与慢.md",
+         "# 思考快与慢\n\n> Source: book\n\n## 一句话总结\n\n人有快慢两套思考系统，快系统省力但容易出错。\n\n## 细节\n\n…\n")
+    note("4 Archive/旧课题/旧笔记.md", "# 旧笔记\n\n不再用了。\n")
+    for d in ("2026-10-01", "2026-10-02", "2026-10-03", "2026-10-04", "2026-10-05"):
+        note(f"Daily/{d}.md", f"# {d}\n\n今天做了实验。\n")
+    note("Templates/模板_日记.md", "# {{date}}\n")
+    (v / "attachments").mkdir()
+    for i in range(3):
+        (v / "attachments" / f"img{i}.png").write_bytes(b"\x89PNG\r\n\x1a\n" + bytes([i]) * 50)
+    note("Scratch/草稿.md", "# 临时\n")
+    note("杂物/一个笔记.md", "# 杂\n")
+    pdf(v / "杂物/一个文件.pdf", ["misc"])
+    (v / "杂物/一张图.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"x" * 50)
+    before = digest_tree(v)
+
+    p = run("adopt", str(v), "--out", str(v / "_out"))
+    check("--out 放在知识库里面会被拒绝（盘点必须只读）", p.returncode == 2 and not (v / "_out").exists())
+    out = root / "out"
+    kb("adopt", str(v), "--out", str(out))
+    check("只读盘点：库里一个字节没变，没有生成 .kb/", digest_tree(v) == before and not (v / ".kb").exists())
+    rows = {r["目录"]: r for r in csv.DictReader((out / "adopt_map.csv").open(encoding="utf-8-sig", newline=""))}
+    expect = {
+        "1 Projects": "知识", "1 Projects/电解液课题": "知识", "2 Areas": "知识", "3 Resources": "知识",
+        "3 Resources/Papers": "原始资料", "4 Archive": "归档", "Daily": "复盘", "Templates": "模板",
+        "attachments": "附件", "Scratch": "忽略", "杂物": "待定",
+    }
+    wrong = [f"{d}→{rows.get(d, {}).get('角色')}" for d, role in expect.items() if rows.get(d, {}).get("角色") != role]
+    check(f"{len(expect)} 个目录的角色建议正确", not wrong, "；".join(wrong))
+    check("项目文件夹归到已识别的项目，主题文件夹各当一个项目",
+          rows["1 Projects/电解液课题"]["项目"] == "电解液" and rows["2 Areas/健康"]["项目"] == "健康",
+          f"{rows['1 Projects/电解液课题']['项目']} / {rows['2 Areas/健康']['项目']}")
+    report = (out / "adopt.md").read_text(encoding="utf-8")
+    check("从总览和标签识别出项目「电解液」", "| 电解液 | 电解液_总览.md | 2 |" in report)
+    draft = (out / "知识索引-草稿.md").read_text(encoding="utf-8")
+    check("索引草稿收进知识目录的笔记，不收模板、归档、日记",
+          all(n in draft for n in ("[[添加剂筛选思路]]", "[[睡眠]]", "[[思考快与慢]]"))
+          and not any(n in draft for n in ("模板_日记", "旧笔记", "2026-10-01")))
+    check("隐私笔记不读、不进草稿，报告里列出", "体检报告2025" not in draft and "体检报告2025" in report)
+    check("没写「一句话」时用“一句话总结”小节做摘要", "人有快慢两套思考系统" in draft)
+    check("标签里的类型和项目被认出来", "## 概念" in draft and "[[添加剂筛选思路]] — 先看 LiPF6 体系的稳定性。 · 电解液" in draft)
+
+    p = run("adopt", str(v), "--out", str(out), "--write")
+    check("--write 没有 --map：拒绝", p.returncode == 2 and not (v / ".kb").exists())
+    bad = out / "bad_map.csv"
+    bad.write_text("目录,角色,项目\n2 Areas,乱写,\n", encoding="utf-8-sig")
+    p = run("adopt", str(v), "--out", str(out), "--map", str(bad), "--write")
+    check("映射表里的角色不合法：拒绝，不写入", p.returncode == 2 and "不在可选角色里" in p.stderr and not (v / ".kb").exists())
+    (v / "知识索引.md").write_text("# 我自己写的索引\n", encoding="utf-8")
+    p = run("adopt", str(v), "--out", str(out), "--map", str(out / "adopt_map.csv"), "--write")
+    check("已有手写的知识索引：不覆盖", p.returncode == 2 and (v / "知识索引.md").read_text(encoding="utf-8") == "# 我自己写的索引\n")
+    (v / "知识索引.md").unlink()
+    kb("adopt", str(v), "--out", str(out), "--map", str(out / "adopt_map.csv"), "--write")
+    after = digest_tree(v)
+    added = sorted(set(after) - set(before))
+    check("确认后写入：只多了 .kb/adopt.csv 和 知识索引.md，原有文件一个没动",
+          added == [".kb/adopt.csv", "知识索引.md"] and all(after[k] == before[k] for k in before), "、".join(added))
+    index = (v / "知识索引.md").read_text(encoding="utf-8")
+    check("写入的索引和草稿收的笔记一样", index.count("\n- [[") == draft.count("\n- [["))
+    out_idx = kb("index", str(v))
+    check("以后 KB index 按映射找卡片，隐私笔记仍不进索引",
+          "知识卡片 4 张" in out_idx and "体检报告2025" not in (v / "知识索引.md").read_text(encoding="utf-8"), out_idx.strip().splitlines()[1] if out_idx.strip() else "")
+    kb("scan", str(v / "3 Resources"), "--out", str(root / "w_ad"))
+    p = run("apply", str(root / "w_ad" / "plan.csv"), "--kb", str(v))
+    check("接入过的库仍需 --merge 才能往里复制资料", p.returncode == 2 and "--merge" in p.stderr)
+
+
 def main() -> None:
     base = Path(sys.argv[1]).expanduser().resolve()
     src, kbdir = base / "src", base / "kb"
@@ -692,6 +787,7 @@ title: 知识库纲要
           "| slides | 文件名 | 课程资料 | 高分子物理 |" in rt2 and "规则 1 用了 1 次" in rt2 and rt2.count("## 最近一次整理用到的规则") == 1)
 
     safety_regressions(base)
+    adopt_tests(base)
 
     # ---------------------------------------------------------- 汇总
     failed = [r for r in results if not r[1]]
