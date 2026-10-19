@@ -197,6 +197,152 @@ def safety_regressions(base: Path) -> None:
     check("只有纲要的文件夹算空文件夹，不需要 --merge", p.returncode == 0, p.stderr.strip()[-150:])
 
 
+def write_rows(path: Path, rows: list[dict], encoding: str = "utf-8-sig") -> None:
+    with path.open("w", encoding=encoding, newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(rows)
+
+
+def safety_regressions_2(base: Path) -> None:
+    """第二轮外部评审（2026-10-19）：隐私门、修改时间容差、读不了的文件夹提示、原路径范围、Windows 名字、adopt 占位符。"""
+    root = base / "safety2"
+    if root.exists():
+        for p in root.rglob("*"):
+            if p.is_dir():
+                p.chmod(0o755)
+        shutil.rmtree(root)
+    root.mkdir(parents=True)
+
+    # ---------------------------------------------------------- 隐私门
+    print("\n安全回归 6. 疑似隐私文件不能经 decide 改成入库")
+    src = root / "priv"
+    src.mkdir()
+    (src / "身份证.txt").write_text("身份证号 110101199001011234\n", encoding="utf-8")
+    (src / "实验_r1.csv").write_text("x\n1\n", encoding="utf-8")
+    kb("scan", str(src), "--out", str(root / "w1"))
+    pp = plan(root / "w1" / "plan.csv")
+    check("scan 在隐私列写“待定”", pp["身份证.txt"].get("隐私") == "待定")
+    dec = root / "w1" / "d.json"
+    dec.write_text(json.dumps({"items": {pp["身份证.txt"]["id"]: {"类别": "论文", "项目": "P", "依据": "看起来是论文", "隐私": "已确认"}}},
+                              ensure_ascii=False), encoding="utf-8")
+    p = run("decide", str(root / "w1" / "plan.csv"), str(dec))
+    pp = plan(root / "w1" / "plan.csv")
+    row = pp["身份证.txt"]
+    check("decide 改不掉隐私标记，依据追加而不是覆盖，并给出提醒",
+          row.get("隐私") == "待定" and row["依据"].startswith("AI：看起来是论文") and "疑似隐私" in row["依据"]
+          and "apply 会拒绝" in p.stderr and "隐私列不能由 decide 改" in p.stderr, row["依据"])
+    kbp = root / "kb_priv"
+    p = run("apply", str(root / "w1" / "plan.csv"), "--kb", str(kbp))
+    check("apply 拒绝复制隐私待定的文件，一个文件都不写",
+          p.returncode == 2 and "疑似隐私" in p.stderr and not kbp.exists(), p.stderr.strip()[-160:])
+    p = run("apply", str(root / "w1" / "plan.csv"), "--kb", str(kbp), "--allow-privacy", "身份证.txt")
+    rules = (kbp / "整理规则.md").read_text(encoding="utf-8") if (kbp / "整理规则.md").exists() else ""
+    log = (kbp / "知识库变更日志.md").read_text(encoding="utf-8") if (kbp / "知识库变更日志.md").exists() else ""
+    check("用户同意后 --allow-privacy 点名才入库，并在整理规则「先看这几条」和日志里留痕",
+          p.returncode == 0 and list(kbp.rglob("身份证.txt")) and "用户确认入库" in rules.split("### B")[0]
+          and "经用户确认入库（身份证.txt）" in log, (p.stdout + p.stderr).strip()[-160:])
+
+    # ---------------------------------------------------------- 修改时间容差
+    print("\n安全回归 7. 修改时间被截成 0–3 位小数都不误报")
+    src = root / "mtime"
+    src.mkdir()
+    (src / "实验_m.csv").write_text("x\n1\n", encoding="utf-8")
+    kb("scan", str(src), "--out", str(root / "w2"))
+    kb("apply", str(root / "w2" / "plan.csv"), "--kb", str(root / "kb_m"))
+    archived = sorted((root / "kb_m" / ".kb" / "plans").glob("*-plan.csv"))[-1]
+    ok = []
+    for digits in (0, 1, 2, 3):
+        rows = list(csv.DictReader(archived.open(encoding="utf-8-sig", newline="")))
+        for r in rows:
+            if r.get("修改时间"):
+                r["修改时间"] = f"{(src / r['文件名']).stat().st_mtime:.{digits}f}"
+        write_rows(archived, rows)
+        p = run("verify", str(archived), "--kb", str(root / "kb_m"))
+        ok.append(p.returncode == 0 and "均未改动" in p.stdout)
+    check("0、1、2、3 位小数都判为未改动", all(ok), str(ok))
+
+    # ---------------------------------------------------------- 读不了的文件夹
+    print("\n安全回归 8. scan 摘要提示读不了的文件夹；隐藏文件夹里锁住的子文件夹也不打勾")
+    src = root / "lock"
+    (src / "锁住的").mkdir(parents=True)
+    (src / ".hidden" / "inner").mkdir(parents=True)
+    (src / "a.txt").write_text("a\n", encoding="utf-8")
+    (src / "锁住的" / "b.txt").write_text("b\n", encoding="utf-8")
+    (src / ".hidden" / "c.txt").write_text("c\n", encoding="utf-8")
+    (src / ".hidden" / "inner" / "d.txt").write_text("d\n", encoding="utf-8")
+    (src / "锁住的").chmod(0)
+    (src / ".hidden" / "inner").chmod(0)
+    try:
+        if os.access(src / "锁住的", os.R_OK):
+            check("（跳过）当前环境锁不住文件夹", True)
+        else:
+            out = kb("scan", str(src), "--out", str(root / "w3"))
+            check("scan 摘要单独提示读不了的文件夹，不说成隐藏文件夹",
+                  "⚠ 读不了的文件夹：2 个" in out and "未展开的文件夹" not in out, out.strip()[-200:])
+            (src / "锁住的").chmod(0o755)
+            kb("scan", str(src), "--out", str(root / "w3b"))
+            p = run("apply", str(root / "w3b" / "plan.csv"), "--kb", str(root / "kb_lock"))
+            out = p.stdout + p.stderr
+            check("只剩隐藏文件夹里的子文件夹锁着：对账仍不通过", p.returncode == 3 and "✅ 原件完好" not in out,
+                  out.strip()[-160:])
+    finally:
+        (src / "锁住的").chmod(0o755)
+        (src / ".hidden" / "inner").chmod(0o755)
+
+    # ---------------------------------------------------------- 原路径范围
+    print("\n安全回归 9. 方案表里的原路径必须在扫描范围内")
+    src, outside = root / "range", root / "outside"
+    src.mkdir()
+    outside.mkdir()
+    (src / "实验_x.csv").write_text("ok\n", encoding="utf-8")
+    (outside / "secret.txt").write_text("SECRET\n", encoding="utf-8")
+    kb("scan", str(src), "--out", str(root / "w4"))
+    rows = list(csv.DictReader((root / "w4" / "plan.csv").open(encoding="utf-8-sig", newline="")))
+    rows[0]["原路径"] = str(outside / "secret.txt")
+    rows[0]["sha256"] = hashlib.sha256((outside / "secret.txt").read_bytes()).hexdigest()
+    write_rows(root / "w4" / "plan.csv", rows)
+    p = run("apply", str(root / "w4" / "plan.csv"), "--kb", str(root / "kb_range"))
+    check("原路径被改到扫描范围外：拒绝执行，一个文件都不写",
+          p.returncode == 2 and "不在这次扫描的资料文件夹里" in p.stderr and not (root / "kb_range").exists(),
+          p.stderr.strip()[-160:])
+
+    # ---------------------------------------------------------- Windows 名字
+    print("\n安全回归 10. 新建的名字要在 Windows 上也能用")
+    kb("scan", str(src), "--out", str(root / "w5"))
+    rid = plan(root / "w5" / "plan.csv")["实验_x.csv"]["id"]
+    bad = []
+    for item in ({"项目": "课题A: 电解液"}, {"项目": "CON"}, {"子目录": "历史?"}, {"入库名": "a|b.csv"}, {"项目": "结尾点."}):
+        (root / "w5" / "d.json").write_text(json.dumps({"items": {rid: item}}, ensure_ascii=False), encoding="utf-8")
+        p = run("decide", str(root / "w5" / "plan.csv"), str(root / "w5" / "d.json"))
+        if p.returncode != 1 or "Windows" not in p.stderr:
+            bad.append(str(item))
+    check("decide 拒绝 : ? | 、CON、以点结尾的名字", not bad, "、".join(bad))
+    vault = root / "vault_win"
+    (vault / "Q&A: 读书?").mkdir(parents=True)
+    (vault / "Q&A: 读书?" / "卡.md").write_text("# 卡\n", encoding="utf-8")
+    p = run("adopt", str(vault), "--out", str(root / "w_ad"))
+    p2 = run("adopt", str(vault), "--out", str(root / "w_ad"), "--map", str(root / "w_ad" / "adopt_map.csv"), "--write")
+    check("adopt 接入已有的、名字带 : ? 的文件夹不受 Windows 规则影响", p.returncode == 0 and p2.returncode == 0,
+          (p2.stdout + p2.stderr).strip()[-160:])
+
+    # ---------------------------------------------------------- adopt 占位符
+    print("\n安全回归 11. --merge 之后 adopt：模板占位符不算项目，旧笔记能进索引")
+    src = root / "merge_src"
+    vault = root / "vault_merge"
+    src.mkdir()
+    (vault / "读书笔记").mkdir(parents=True)
+    (src / "实验_1.csv").write_text("x\n", encoding="utf-8")
+    (vault / "读书笔记" / "旧卡.md").write_text("---\n一句话: 旧库里的一张卡\n用于: 测试并入\n---\n# 旧卡\n", encoding="utf-8")
+    kb("scan", str(src), "--out", str(root / "w6"))
+    kb("apply", str(root / "w6" / "plan.csv"), "--kb", str(vault), "--merge")
+    kb("adopt", str(vault), "--out", str(root / "w6ad"))
+    ad = (root / "w6ad" / "adopt.md").read_text(encoding="utf-8")
+    kb("adopt", str(vault), "--out", str(root / "w6ad"), "--map", str(root / "w6ad" / "adopt_map.csv"), "--write")
+    check("盘点报告里没有 {{项目}}；写入映射后旧笔记进了知识索引",
+          "{{" not in ad and "旧卡" in (vault / "知识索引.md").read_text(encoding="utf-8"))
+
+
 def adopt_tests(base: Path) -> None:
     """接入已有知识库：一个 PARA 风格的 Obsidian 库，只读盘点 → 确认映射 → 原地索引。"""
     sys.path.insert(0, str(HERE))
@@ -788,6 +934,7 @@ title: 知识库纲要
 
     safety_regressions(base)
     adopt_tests(base)
+    safety_regressions_2(base)
 
     # ---------------------------------------------------------- 汇总
     failed = [r for r in results if not r[1]]

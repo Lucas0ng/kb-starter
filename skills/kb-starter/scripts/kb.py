@@ -87,8 +87,11 @@ STATUS_COPY, STATUS_AI, STATUS_SKIP, STATUS_DONE, STATUS_REGISTER = "复制", "�
 STATUS_BLOCKED = "无法读取"  # iCloud 未下载、没有读权限、失效的链接：不入库，但必须让用户看到
 
 # 子目录：放在目标目录下的一层，用于“历史版本”或同名文件保留来源文件夹；入库名：给无意义文件名起的新名字（只改副本）
+# 隐私：scan 写“待定”（文件名像隐私资料），decide 改不掉；apply 遇到“待定”却要复制的直接拒绝，
+# 只有用户在对话里明确同意、AI 用 --allow-privacy 点名后才变成“已确认”。用户规则明确归类的写“规则放行”。
 PLAN_FIELDS = ["id", "状态", "类别", "项目", "子目录", "入库名", "目标目录", "文件名", "原路径", "依据", "置信度",
-               "大小KB", "日期", "修改时间", "sha256"]
+               "隐私", "大小KB", "日期", "修改时间", "sha256"]
+PRIVACY_PENDING, PRIVACY_OK, PRIVACY_RULE = "待定", "已确认", "规则放行"
 # 来源相对路径：相对资料文件夹的路径，reorg 按它套用整理规则（旧清单没有这一列时退回用原路径的最后几层）
 MANIFEST_FIELDS = ["sha256", "知识库路径", "原路径", "类别", "项目", "入库时间", "来源相对路径"]
 
@@ -556,11 +559,14 @@ def read_plan(path: Path) -> list[dict]:
 
 
 UNSAFE_PART_RE = re.compile(r"[\\\x00-\x1f\x7f]")
+WINDOWS_BAD_RE = re.compile(r'[<>:"|?*]')
+WINDOWS_RESERVED_RE = re.compile(r"^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$", re.I)
 
 
-def unsafe_name(value: str, multi: bool = False) -> str:
+def unsafe_name(value: str, multi: bool = False, portable: bool = True) -> str:
     """项目名、入库名会拼进路径，必须是一段普通名字；子目录（multi）可以多段，但每段都要普通。
-    返回问题描述，没问题返回空串。"""
+    portable：要新建的名字还得在 Windows 上能用（不含 : * ? " < > |、不是 CON 这类保留名、不以点或空格结尾）；
+    校验用户库里已有的文件夹名时传 False。返回问题描述，没问题返回空串。"""
     v = (value or "").strip()
     if not v:
         return ""
@@ -568,6 +574,8 @@ def unsafe_name(value: str, multi: bool = False) -> str:
     for part in parts:
         if part in ("", ".", "..") or UNSAFE_PART_RE.search(part) or "/" in part:
             return f"「{value}」带路径符号（/ \\ .. 或控制字符），只能是一段普通名字"
+        if portable and (WINDOWS_BAD_RE.search(part) or WINDOWS_RESERVED_RE.match(part) or part.endswith((".", " "))):
+            return f"「{value}」在 Windows 上不能当文件夹或文件名（含 : * ? \" < > | 之一、是 CON 这类保留名，或以点、空格结尾）"
     return ""
 
 
@@ -763,9 +771,12 @@ def walk_source(src: Path, kb: Path | None) -> tuple[list[Path], list[dict]]:
                 folders.append({"path": p, "reason": f"符号链接文件夹，未跟随（指向 {os.path.realpath(p)}）", "size": 0})
             elif d.startswith(".") or d in SKIP_DIRS:
                 n, size, bad = count_files(p)
-                if n or bad:
-                    more = f"（另有 {bad} 个子文件夹读不了，实际可能更多）" if bad else ""
-                    folders.append({"path": p, "reason": f"隐藏或依赖文件夹，含 {n} 个文件{more}，未展开；需要其中的文件请拿出来再扫", "size": size})
+                if bad:  # 里面有读不了的子文件夹：文件数是下限，对账不能说一个不漏
+                    folders.append({"path": p, "size": size, "blocked": True,
+                                    "reason": f"隐藏或依赖文件夹，含 {n} 个文件，另有 {bad} 个子文件夹{UNREADABLE_DIR}；"
+                                              "改好权限后重新扫描"})
+                elif n:
+                    folders.append({"path": p, "reason": f"隐藏或依赖文件夹，含 {n} 个文件，未展开；需要其中的文件请拿出来再扫", "size": size})
             else:
                 keep.append(d)
         dirs[:] = keep
@@ -895,7 +906,10 @@ def cmd_scan(args: argparse.Namespace) -> None:
         if privacy and not (early_rule and early_rule["归为"]):
             status, cat, conf, date, snippet = STATUS_AI, "", "", "", ""
             reason = f"疑似隐私文件（文件名含「{privacy[0]}」），没有读取内容，先问用户是否入库"
+            row["隐私"] = PRIVACY_PENDING
         else:
+            if privacy:
+                row["隐私"] = PRIVACY_RULE
             try:
                 status, cat, reason, conf, date, snippet = classify(path, rel)
             except OSError as e:
@@ -1013,7 +1027,7 @@ def write_plan_md(path: Path, rows: list[dict], meta: dict | None = None) -> Non
     table("旧版本（放进 历史版本/，不删除）", [r for r in rows if r.get("子目录", "").startswith("历史版本")],
           "| # | 文件 | 归到 | 说明 |", lambda r: f"| {r['id']} | {r['文件名']} | {where(r)} | {r['依据'].split('；')[-1]} |")
     table("文件名看不出内容的（AI 可建议入库名，原件不改名）",
-          [r for r in rows if "建议起入库名" in r["依据"] and not r.get("入库名")],
+          [r for r in rows if r["状态"] in (STATUS_COPY, STATUS_AI) and "建议起入库名" in r["依据"] and not r.get("入库名")],
           "| # | 文件 | 归到 |", lambda r: f"| {r['id']} | {r['文件名']} | {where(r) if r['类别'] else '待判断'} |")
     table("将改名入库的（只改副本）", [r for r in rows if r.get("入库名")],
           "| # | 原名 | 入库名 |", lambda r: f"| {r['id']} | {r['文件名']} | {r['入库名']} |")
@@ -1061,9 +1075,13 @@ def summarize(rows: list[dict], plan_csv: Path) -> None:
     print(f"方案表：{plan_csv}")
     print("状态：" + "，".join(f"{k} {v}" for k, v in c.most_common()))
     print("类别：" + "，".join(f"{k} {v}" for k, v in cats.most_common()))
-    folders = len(rows) - len(files)
-    if folders:
-        print(f"未展开的文件夹：{folders} 个（隐藏、依赖或符号链接，见 plan.md“不处理”）")
+    folder_rows = [r for r in rows if r["文件名"].endswith("/")]
+    locked = [r for r in folder_rows if r["状态"] == STATUS_BLOCKED]
+    if len(folder_rows) > len(locked):
+        print(f"未展开的文件夹：{len(folder_rows) - len(locked)} 个（隐藏、依赖或符号链接，见 plan.md“不处理”）")
+    if locked:
+        print(f"⚠ 读不了的文件夹：{len(locked)} 个（没有权限，里面的文件无法清点；apply 的对账会不通过）。"
+              "先告诉用户改好权限再重新扫描：" + "、".join(r["原路径"] for r in locked[:5]))
     if c.get(STATUS_BLOCKED):
         print(f"⚠ 读不了：{c[STATUS_BLOCKED]} 个，必须告诉用户（见 plan.md 顶部）")
     pending = [r["id"] for r in rows if r["状态"] == STATUS_AI]
@@ -1102,7 +1120,7 @@ def cmd_decide(args: argparse.Namespace) -> None:
             new = str(d["入库名"]).strip()
             ext = Path(r["文件名"]).suffix
             if not new or unsafe_name(new):
-                errors.append(f"id {rid} 的入库名「{new}」不能为空或带路径")
+                errors.append(f"id {rid} 的入库名" + (unsafe_name(new) or "不能为空"))
                 continue
             if not Path(new).suffix:
                 new += ext
@@ -1114,9 +1132,18 @@ def cmd_decide(args: argparse.Namespace) -> None:
         for field in ("项目", "子目录"):
             if field in d:
                 r[field] = d[field]
+        if "隐私" in d:
+            print(f"id {rid}：隐私列不能由 decide 改，已忽略；用户同意入库后用 apply --allow-privacy 点名", file=sys.stderr)
         r["状态"] = d.get("状态", STATUS_COPY if r["状态"] == STATUS_AI else r["状态"])
         if "依据" in d:
-            r["依据"] = "AI：" + d["依据"]
+            # 追加，不覆盖：保留规则当初的判断（尤其是“疑似隐私”），审查时看得到 AI 改了什么
+            orig = r["依据"]
+            if orig.startswith("AI："):
+                orig = orig.split("；原判断：", 1)[1] if "；原判断：" in orig else ""
+            r["依据"] = "AI：" + d["依据"] + (f"；原判断：{orig}" if orig else "")
+        if r.get("隐私") == PRIVACY_PENDING and r["状态"] == STATUS_COPY:
+            print(f"注意 id {rid} {r['文件名']} 是疑似隐私文件：改成复制后 apply 会拒绝执行。"
+                  "只有用户在对话里明确同意入库，才用 apply --allow-privacy 点名这个文件。", file=sys.stderr)
         if "子目录" in d and PINNED not in r["依据"]:
             r["依据"] += PINNED
         r["置信度"] = d.get("置信度", "AI")
@@ -1564,7 +1591,8 @@ def reconcile(rows: list[dict], kb: Path, meta: dict, full: bool = False) -> tup
             if "e" in v.lower():
                 continue
             st = stat_quiet(p)
-            if st and abs(st.st_mtime - recorded) > (0.01 if "." in v else 1.0):
+            # 统一 1 秒容差：Excel、LibreOffice 会把小数位截成 0–2 位，四舍五入后最多差 0.5 秒
+            if st and abs(st.st_mtime - recorded) > 1.0:
                 changed.append(r["文件名"])
     if changed:
         problems.append(f"{len(changed)} 个原件在扫描之后被修改过（不是本工具改的）：" + "、".join(changed[:10]))
@@ -1623,6 +1651,37 @@ def cmd_apply(args: argparse.Namespace) -> None:
         print("这些条目的项目、子目录或入库名不安全，没有写入任何文件（纲要或整理规则里的项目名也要改）：\n  "
               + "\n  ".join(unsafe), file=sys.stderr)
         sys.exit(2)
+    # 原路径必须在这次扫描的资料文件夹里（登记的必须在知识库里）：方案表被改过或被注入时，不能把别处的文件拷进来
+    if meta.get("src"):
+        root = os.path.normpath(meta["src"]) + os.sep
+        stray = [r for r in rows if not r["文件名"].endswith("/") and (
+            (r["状态"] in (STATUS_COPY, STATUS_AI) and not (os.path.normpath(r["原路径"]) + os.sep).startswith(root))
+            or (r["状态"] == STATUS_REGISTER and not inside(kb, Path(r["原路径"]))))]
+        if stray:
+            print("这些条目的原路径不在这次扫描的资料文件夹里（方案表可能被改过），没有写入任何文件：\n  "
+                  + "\n  ".join(f"#{r['id']} {r['原路径']}" for r in stray), file=sys.stderr)
+            sys.exit(2)
+    else:
+        print("提示：方案表旁边没有 scan_meta.json，无法核对原路径是否在扫描范围内。", file=sys.stderr)
+    # 隐私门：疑似隐私文件只有用户在对话里明确同意、用 --allow-privacy 点名后才复制；decide 清不掉这个标记
+    allow = set(args.allow_privacy or [])
+    held_back, allowed_priv = [], []
+    for r in rows:
+        pending_priv = r.get("隐私") == PRIVACY_PENDING or (not r.get("隐私") and "疑似隐私" in r["依据"])
+        if r["状态"] == STATUS_COPY and pending_priv:
+            (allowed_priv if (r["文件名"] in allow or r["id"] in allow) else held_back).append(r)
+    if held_back:
+        print("这些是疑似隐私文件，默认不入库，没有写入任何文件：\n  "
+              + "\n  ".join(f"#{r['id']} {r['文件名']}（{r['依据']}）" for r in held_back)
+              + "\n不入库：在 decisions.json 里写 {\"状态\": \"跳过\", \"依据\": \"隐私待定：默认不入库，等你决定\"}。"
+              "\n用户在对话里明确同意入库：apply 加 --allow-privacy 后面跟这些文件名。", file=sys.stderr)
+        sys.exit(2)
+    unknown = allow - {r["文件名"] for r in allowed_priv} - {r["id"] for r in allowed_priv}
+    if unknown:
+        print("--allow-privacy 里这些名字不是待确认的疑似隐私文件，已忽略：" + "、".join(sorted(unknown)), file=sys.stderr)
+    for r in allowed_priv:
+        r["隐私"] = PRIVACY_OK
+        r["依据"] += "；用户确认入库（--allow-privacy）"
     # 已有内容、又没经 kb-starter 入库过的文件夹（包括只 adopt 过的）：不能悄悄塞进骨架，要用户同意并入
     if not args.merge and kb.is_dir() and not (kb / ".kb" / "manifest.csv").exists():
         others = sorted(p.name for p in kb.iterdir() if p.name not in (OUTLINE, ".kb") and p.name.lower() not in JUNK_NAMES)
@@ -1643,7 +1702,7 @@ def cmd_apply(args: argparse.Namespace) -> None:
     for r in rows:
         status = r["状态"]
         if status == STATUS_AI and args.pending_to_unsorted:
-            if "疑似隐私" in r["依据"]:  # 隐私文件不能“先放进待定再说”：没人决定就不入库
+            if r.get("隐私") == PRIVACY_PENDING or "疑似隐私" in r["依据"]:  # 隐私文件不能“先放进待定再说”：没人决定就不入库
                 status = r["状态"] = STATUS_SKIP
                 r["依据"] = f"{PRIVACY_HOLD}：默认不入库，等你决定（{r['依据']}）"
                 held += 1
@@ -1708,7 +1767,7 @@ def cmd_apply(args: argparse.Namespace) -> None:
     for r in rows:
         if (r["状态"] == STATUS_SKIP and r.get("sha256") and r["依据"].startswith("AI：")
                 and PRIVACY_HOLD not in r["依据"]):
-            ignored[r["sha256"]] = f"{r['文件名']} · {r['依据'][3:]}"
+            ignored[r["sha256"]] = f"{r['文件名']} · {r['依据'][3:].split('；原判断：')[0]}"
     if ignored:
         with (kb / ".kb" / "ignored.csv").open("w", encoding="utf-8-sig", newline="") as f:
             w = csv.writer(f)
@@ -1735,7 +1794,9 @@ def cmd_apply(args: argparse.Namespace) -> None:
     cats = Counter(r["类别"] for r in copied + registered)
     detail = "、".join(f"{k} {v}" for k, v in cats.most_common())
     if copied or registered:
-        append_changelog(kb, f"**入库 {len(copied) + len(registered)} 个文件**（{detail}）：原件未改动，{verdict}；"
+        priv = (f"其中 {len(allowed_priv)} 个疑似隐私文件经用户确认入库（{'、'.join(r['文件名'] for r in allowed_priv)}）；"
+                if allowed_priv else "")
+        append_changelog(kb, f"**入库 {len(copied) + len(registered)} 个文件**（{detail}）：原件未改动，{verdict}；{priv}"
                              f"方案表和对账单存于 `.kb/plans/{stamp}-*`，清单见 [[资料索引]]。")
     print(f"知识库：{kb}")
     if created:
@@ -1814,7 +1875,7 @@ def rules_report(rows: list[dict], stamp: str, user_rules: list[dict]) -> list[s
     # A 先看：AI 逐个判断的、打平的、低置信度、放进待定的、没入库的隐私文件、读不了的
     a_rows = [r for r in files if (r["状态"] in (STATUS_COPY, STATUS_SKIP) and r["依据"].startswith("AI："))
               or (r["状态"] == STATUS_COPY and (r["置信度"] == "低" or r["类别"] == "待定" or "同时命中" in r["依据"]))
-              or PRIVACY_HOLD in r["依据"] or r["状态"] == STATUS_BLOCKED]
+              or PRIVACY_HOLD in r["依据"] or r["状态"] == STATUS_BLOCKED or r.get("隐私") == PRIVACY_OK]
     def outcome(r: dict) -> str:
         if r["状态"] == STATUS_COPY:
             return f"`{dest_dir(r['类别'], r['项目'], r.get('子目录', ''))}`"
@@ -2753,6 +2814,8 @@ def obsidian_ignores(kb: Path) -> list[str]:
 
 def norm_project(name: str) -> str:
     name = re.sub(r"[\[\]\"']", "", name or "").strip()
+    if "{{" in name:  # 模板里的占位符（项目/{{项目}}）不是项目
+        return ""
     return re.sub(r"[_\s]*(项目)?[_\s]*总览$|项目$", "", name).strip() or name
 
 
@@ -3004,8 +3067,10 @@ def cmd_adopt(args: argparse.Namespace) -> None:
             d = r["目录"].strip().strip("/")
             if r["角色"] not in ADOPT_ROLES:
                 errors.append(f"`{d}` 的角色「{r['角色']}」不在可选角色里：{'、'.join(ADOPT_ROLES)}")
-            if unsafe_name(r.get("项目", "")) or unsafe_name(d, multi=True):
-                errors.append(f"`{d}`：{unsafe_name(r.get('项目', '')) or unsafe_name(d, multi=True)}")
+            # 已有文件夹名不按 Windows 规则卡：接入只建映射，不新建文件夹
+            bad = unsafe_name(r.get("项目", ""), portable=False) or unsafe_name(d, multi=True, portable=False)
+            if bad:
+                errors.append(f"`{d}`：{bad}")
             elif not (kb / d).is_dir():
                 errors.append(f"`{d}` 不是知识库里的文件夹")
         if errors:
@@ -3154,7 +3219,10 @@ def main() -> None:
     a.add_argument("--name", help="知识库名称，用于入口文件标题")
     a.add_argument("--dry-run", action="store_true", help="只预演，不写文件")
     a.add_argument("--pending-to-unsorted", action="store_true", help="把仍是待AI的条目放进 09_待定")
-    a.add_argument("--merge", action="store_true", help="知识库文件夹已有内容、但不是 kb-starter 建的库时，用户同意后才并入")
+    a.add_argument("--merge", action="store_true", help="知识库文件夹已有内容、但不是 kb-starter 建的库时，用户同意后才并入"
+                   "（只把新资料并入；已有笔记要进知识索引请用 adopt）")
+    a.add_argument("--allow-privacy", nargs="+", metavar="文件名", default=[],
+                   help="用户在对话里明确同意入库的疑似隐私文件（文件名或 id）；没点名的疑似隐私文件一律不复制")
     a.set_defaults(func=cmd_apply)
 
     v = sub.add_parser("verify", help="对账：原件完好、一个不漏、副本一致")
