@@ -343,6 +343,28 @@ def safety_regressions_2(base: Path) -> None:
           "{{" not in ad and "旧卡" in (vault / "知识索引.md").read_text(encoding="utf-8"))
 
 
+def adopted_overview_tests(base: Path) -> None:
+    """接入的库：总览常叫「X项目_总览.md」，也没有入库清单。体检、overview、pack 都要认得它，不能另建一份。"""
+    print("\n接入的库：认得「X项目_总览.md」")
+    vault = base / "adopted_ov"
+    if vault.exists():
+        shutil.rmtree(vault)
+    (vault / "01_知识提炼").mkdir(parents=True)
+    (vault / "知识库纲要.md").write_text("---\n更新: 2026-10-19\n---\n# 纲要\n\n## 项目\n\n### 项目：电解液\n\n"
+                                       "- 核心问题：\n  1. 添加剂浓度多少时循环最稳？\n- 关键词：电解液\n", encoding="utf-8")
+    (vault / "电解液项目_总览.md").write_text("---\n状态: 第 1 轮筛选完成\n---\n# 电解液项目 · 总览\n\n电解液现状。\n", encoding="utf-8")
+    (vault / "01_知识提炼" / "卡.md").write_text("# 卡\n\n电解液的一张卡。\n", encoding="utf-8")
+    kb("lint", str(vault), "--out", str(base / "adopted_ov_lint.md"))
+    sec = (base / "adopted_ov_lint.md").read_text(encoding="utf-8").split("## 10.")[1]
+    check("体检认得「电解液项目_总览.md」，没有入库清单时不报“没有分到文件”",
+          "还没有项目总览" not in sec and "资料里没有分到它的文件" not in sec and "正常" in sec, sec.strip()[-120:])
+    kb("overview", str(vault))
+    check("overview 不在根目录另建「电解液_总览.md」，草稿放进工作区",
+          not (vault / "电解液_总览.md").exists() and list((vault / "99_工作区" / "总览草稿").glob("电解液*")))
+    kb("pack", str(vault), "--project", "电解液", "--out", str(base / "adopted_ov_pack.md"))
+    check("pack --project 能找到「X项目_总览.md」", "电解液现状" in (base / "adopted_ov_pack.md").read_text(encoding="utf-8"))
+
+
 def adopt_tests(base: Path) -> None:
     """接入已有知识库：一个 PARA 风格的 Obsidian 库，只读盘点 → 确认映射 → 原地索引。"""
     sys.path.insert(0, str(HERE))
@@ -935,6 +957,7 @@ title: 知识库纲要
     safety_regressions(base)
     adopt_tests(base)
     safety_regressions_2(base)
+    adopted_overview_tests(base)
 
     # ---------------------------------------------------------- 汇总
     failed = [r for r in results if not r[1]]

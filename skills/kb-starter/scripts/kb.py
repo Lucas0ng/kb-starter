@@ -2340,6 +2340,14 @@ def cmd_lint(args: argparse.Namespace) -> None:
         print(text)
 
 
+def find_overview(kb: Path, name: str) -> Path | None:
+    """项目总览：kb-starter 写成「X_总览.md」，接入的库常写成「X项目_总览.md」，按项目名对上就算。"""
+    exact = kb / f"{name}_总览.md"
+    if exact.exists():
+        return exact
+    return next((p for p in sorted(kb.glob("*_总览.md")) if norm_project(p.stem) == name), None)
+
+
 def outline_report(kb: Path, notes: list[Path], changed: list[Path], manifest: dict) -> list[str]:
     outline = read_outline(kb / OUTLINE)
     if not outline.get("projects"):
@@ -2357,16 +2365,18 @@ def outline_report(kb: Path, notes: list[Path], changed: list[Path], manifest: d
         terms = [p["name"], *p["aliases"]]
         touched = [n for n in changed if term_hits(n.relative_to(kb).as_posix() + " " + texts[n][:3000], terms)]
         flags = []
-        if not in_manifest.get(p["name"]):
+        # 接入的库（adopt）没有入库清单，资料文件数无从统计，不报“没有分到文件”
+        if manifest and not in_manifest.get(p["name"]):
             flags.append("资料里没有分到它的文件")
         if not touched:
             flags.append("近期没有相关笔记改动")
-        if not (kb / f"{p['name']}_总览.md").exists():
+        if not find_overview(kb, p["name"]):
             flags.append("还没有项目总览（运行 overview）")
         if not p["questions"]:
             flags.append("纲要里没写核心问题")
         state = "；".join(flags) if flags else "正常"
-        out.append(f"- {p['kind']}「{p['name']}」：{in_manifest.get(p['name'], 0)} 个资料文件，近期相关改动 {len(touched)} 篇 · {state}")
+        count = f"{in_manifest.get(p['name'], 0)} 个资料文件，" if manifest else ""
+        out.append(f"- {p['kind']}「{p['name']}」：{count}近期相关改动 {len(touched)} 篇 · {state}")
     extra = [(k, v) for k, v in in_manifest.most_common() if k and k not in names]
     if extra:
         out.append("- 资料里有、纲要里没有的项目：" + "、".join(f"{k}（{v} 个文件）" for k, v in extra))
@@ -2697,7 +2707,7 @@ def cmd_overview(args: argparse.Namespace) -> None:
         for m in files:
             st = stat_quiet(kb / m["知识库路径"])
             m["_mtime"] = st.st_mtime if st else 0
-        target = kb / f"{p['name']}_总览.md"
+        target = find_overview(kb, p["name"]) or kb / f"{p['name']}_总览.md"  # 已有「X项目_总览.md」时不另建一份
         if target.exists() and not args.force:
             target = kb / "99_工作区/总览草稿" / f"{p['name']}_总览-草稿-{today:%Y%m%d}.md"
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -3156,7 +3166,8 @@ def cmd_pack(args: argparse.Namespace) -> None:
     nav = kb / "知识库导航.md"
     if nav.exists():
         parts += ["---", "## 知识库导航", "", body_of(nav.read_text(encoding="utf-8"))]
-    overviews = [kb / f"{args.project}_总览.md"] if args.project else sorted(kb.glob("*_总览.md"))
+    overviews = ([find_overview(kb, args.project) or kb / f"{args.project}_总览.md"] if args.project
+                 else sorted(kb.glob("*_总览.md")))
     for ov in overviews:
         if ov.exists():
             parts += ["---", f"## {ov.stem}", "", body_of(ov.read_text(encoding="utf-8"))]
