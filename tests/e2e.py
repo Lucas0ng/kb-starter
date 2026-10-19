@@ -10,6 +10,7 @@ import csv
 import datetime as dt
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -52,6 +53,148 @@ def digest_tree(root: Path) -> dict[str, str]:
 def by_path(path: Path, src: Path) -> dict[str, dict]:
     with path.open(encoding="utf-8-sig", newline="") as f:
         return {str(Path(r["原路径"]).relative_to(src)): r for r in csv.DictReader(f)}
+
+
+def run(*args: str) -> subprocess.CompletedProcess:
+    """跑 kb.py，不管退出码，留给断言判断。"""
+    return subprocess.run([sys.executable, str(KB_PY), *args], capture_output=True, text=True)
+
+
+def safety_regressions(base: Path) -> None:
+    """外部评审（2026-10）指出的 5 个问题，每个一组回归测试。"""
+    sys.path.insert(0, str(HERE))
+    from make_fixtures import pdf
+
+    root = base / "safety"
+    if root.exists():
+        for p in root.rglob("*"):
+            if p.is_dir():
+                p.chmod(0o755)
+        shutil.rmtree(root)
+    root.mkdir(parents=True)
+
+    # ---------------------------------------------------------- 隐私
+    print("\n安全回归 1. 隐私文件不读内容，片段只给待AI")
+    src = root / "privacy"
+    src.mkdir()
+    id_no, card_no = "110101199001011234", "6222020200112233445"
+    (src / "身份证_扫描件.txt").write_text(f"姓名 张三\n身份证号 {id_no}\n", encoding="utf-8")
+    pdf(src / "银行流水_2026.pdf", ["Account statement", f"Card {card_no}"])
+    (src / "体检报告_2026.txt").write_text("肝功能异常，建议复查\n", encoding="utf-8")
+    (src / "note.txt").write_text("普通笔记，规则能直接分类\n", encoding="utf-8")
+    pdf(src / "scan_0099.pdf", ["handwritten page"])  # 普通的待AI文件：片段照常给
+    kb("scan", str(src), "--out", str(root / "w_priv"))
+    snip = (root / "w_priv" / "snippets.jsonl").read_text(encoding="utf-8")
+    pp = plan(root / "w_priv" / "plan.csv")
+    check("身份证号、银行卡号、体检内容都没有落进片段文件",
+          id_no not in snip and card_no not in snip and "肝功能" not in snip)
+    check("隐私文件标成待AI，并写明没有读取内容",
+          all(pp[n]["状态"] == "待AI" and "没有读取内容" in pp[n]["依据"]
+              for n in ("身份证_扫描件.txt", "银行流水_2026.pdf", "体检报告_2026.txt")))
+    entries = [json.loads(line) for line in snip.splitlines()]
+    check("片段文件只有待AI条目，隐私条目只留标记",
+          all(e["状态"] == "待AI" for e in entries) and "note.txt" not in {e["文件名"] for e in entries}
+          and all(e.get("隐私") and not e["片段"] for e in entries if "疑似隐私" in pp[e["文件名"]]["依据"]),
+          f"{len(entries)} 条")
+    check("普通待AI文件的片段照常给", any(e["文件名"] == "scan_0099.pdf" and "handwritten" in e["片段"] for e in entries))
+
+    # ---------------------------------------------------------- 无权限文件夹
+    print("\n安全回归 2. 读不了的文件夹不能报“一个不漏”")
+    src = root / "locked_src"
+    (src / "锁住的").mkdir(parents=True)
+    (src / "a_note.txt").write_text("能读的\n", encoding="utf-8")
+    (src / "锁住的" / "b.txt").write_text("读不到的\n", encoding="utf-8")
+    (src / "锁住的").chmod(0)
+    try:
+        if os.access(src / "锁住的", os.R_OK):  # root 或 Windows 上锁不住，跳过
+            check("（跳过）当前环境锁不住文件夹", True)
+        else:
+            kb("scan", str(src), "--out", str(root / "w_lock"))
+            pl = plan(root / "w_lock" / "plan.csv")
+            check("读不了的文件夹在方案表里有一行，状态是无法读取",
+                  pl.get("锁住的/", {}).get("状态") == "无法读取", str(pl.get("锁住的/")))
+            p = run("apply", str(root / "w_lock" / "plan.csv"), "--kb", str(root / "kb_lock"))
+            out = p.stdout + p.stderr
+            check("对账退出码 3，指出文件夹没法清点，不打勾",
+                  p.returncode == 3 and "没法清点" in out and "✅ 原件完好" not in out, out.strip()[-200:])
+    finally:
+        (src / "锁住的").chmod(0o755)
+
+    # ---------------------------------------------------------- 路径穿越
+    print("\n安全回归 3. 项目名、子目录、入库名不能把文件写出知识库")
+    src = root / "trav_src"
+    src.mkdir()
+    (src / "data_r1.csv").write_text("x,y\n1,2\n", encoding="utf-8")
+    kb("scan", str(src), "--out", str(root / "w_trav"))
+    rid = plan(root / "w_trav" / "plan.csv")["data_r1.csv"]["id"]
+    for label, item, extra in (("项目 ../", {"项目": "../../../kb-escape"}, {}),
+                               ("子目录 a/../..", {"子目录": "a/../../b"}, {}),
+                               ("入库名 ..", {"入库名": ".."}, {}),
+                               ("改名到 ../", {}, {"rename_projects": {"": "../x"}})):
+        dec = root / "w_trav" / "bad.json"
+        dec.write_text(json.dumps({"items": {rid: item} if item else {}, **extra}, ensure_ascii=False), encoding="utf-8")
+        p = run("decide", str(root / "w_trav" / "plan.csv"), str(dec))
+        check(f"decide 拒绝{label}", p.returncode == 1 and "路径" in p.stderr, p.stderr.strip()[-120:])
+    # 绕过 decide：直接手改 plan.csv
+    rows = list(csv.DictReader((root / "w_trav" / "plan.csv").open(encoding="utf-8-sig", newline="")))
+    for r in rows:
+        if r["文件名"] == "data_r1.csv":
+            r["项目"] = "../../kb-escape"
+    with (root / "w_trav" / "plan.csv").open("w", encoding="utf-8-sig", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(rows)
+    kbt = root / "deep" / "a" / "kb"
+    p = run("apply", str(root / "w_trav" / "plan.csv"), "--kb", str(kbt))
+    check("手改 plan.csv 的穿越项目名：apply 拒绝，一个文件都不写",
+          p.returncode == 2 and not kbt.exists() and not list(root.rglob("kb-escape")), p.stderr.strip()[-150:])
+    kbr = root / "kb_rule"
+    kbr.mkdir()
+    (kbr / "整理规则.md").write_text("## 你的规则\n\n| 匹配 | 看哪里 | 归为 | 项目 | 为什么 |\n|---|---|---|---|---|\n"
+                                    "| data | 文件名 | 实验记录 | ../../evil | 测试 |\n", encoding="utf-8")
+    p = run("scan", str(src), "--out", str(root / "w_rule"), "--kb", str(kbr))
+    check("整理规则里的穿越项目名被忽略并提示",
+          "这一行先不用" in p.stderr and plan(root / "w_rule" / "plan.csv")["data_r1.csv"]["项目"] != "../../evil")
+
+    # ---------------------------------------------------------- 编码
+    print("\n安全回归 4. Excel 另存的方案表")
+    src = root / "enc_src"
+    src.mkdir()
+    (src / "实验记录_r2.csv").write_text("x\n1\n", encoding="utf-8")
+    kb("scan", str(src), "--out", str(root / "w_gbk"))
+    pc = root / "w_gbk" / "plan.csv"
+    rows = list(csv.DictReader(pc.open(encoding="utf-8-sig", newline="")))
+    for r in rows:  # Excel 常规格式会把修改时间的小数位丢掉
+        r["修改时间"] = r["修改时间"].split(".")[0] if r.get("修改时间") else ""
+    with pc.open("w", encoding="gb18030", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(rows)
+    p = run("apply", str(pc), "--kb", str(root / "kb_gbk"))
+    check("GBK 编码、丢了小数位的方案表能正常入库并通过对账",
+          p.returncode == 0 and "✅" in p.stdout and "Traceback" not in p.stderr, (p.stdout + p.stderr).strip()[-200:])
+    pc.write_text("id;状态;原路径\n1;复制;x\n", encoding="utf-8")
+    p = run("apply", str(pc), "--kb", str(root / "kb_gbk2"))
+    check("表头坏了：给出“另存为 CSV UTF-8”的提示，不是报错堆栈",
+          p.returncode == 2 and "CSV UTF-8" in p.stderr and "Traceback" not in p.stderr, p.stderr.strip()[-150:])
+
+    # ---------------------------------------------------------- 非空文件夹
+    print("\n安全回归 5. 已有内容的文件夹不能悄悄塞骨架")
+    vault = root / "vault"
+    vault.mkdir()
+    (vault / "我的笔记.md").write_text("# 旧笔记\n", encoding="utf-8")
+    kb("scan", str(src), "--out", str(root / "w_merge"))
+    p = run("apply", str(root / "w_merge" / "plan.csv"), "--kb", str(vault))
+    check("没有 --merge：退出码 2，提示先问用户，没有写入骨架",
+          p.returncode == 2 and "--merge" in p.stderr and not (vault / "AGENTS.md").exists(), p.stderr.strip()[-150:])
+    p = run("apply", str(root / "w_merge" / "plan.csv"), "--kb", str(vault), "--merge")
+    check("用户同意后 --merge 并入，旧笔记原样保留",
+          p.returncode == 0 and (vault / "AGENTS.md").exists() and (vault / "我的笔记.md").read_text(encoding="utf-8") == "# 旧笔记\n")
+    fresh = root / "fresh"
+    fresh.mkdir()
+    (fresh / "知识库纲要.md").write_text("# 纲要\n", encoding="utf-8")
+    p = run("apply", str(root / "w_merge" / "plan.csv"), "--kb", str(fresh))
+    check("只有纲要的文件夹算空文件夹，不需要 --merge", p.returncode == 0, p.stderr.strip()[-150:])
 
 
 def main() -> None:
@@ -547,6 +690,8 @@ title: 知识库纲要
     rt2 = rules_md.read_text(encoding="utf-8")
     check("再次 apply：你的规则原样保留，报告写明规则用了几次",
           "| slides | 文件名 | 课程资料 | 高分子物理 |" in rt2 and "规则 1 用了 1 次" in rt2 and rt2.count("## 最近一次整理用到的规则") == 1)
+
+    safety_regressions(base)
 
     # ---------------------------------------------------------- 汇总
     failed = [r for r in results if not r[1]]

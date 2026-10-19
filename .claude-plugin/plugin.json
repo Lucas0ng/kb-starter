@@ -1,7 +1,7 @@
 {
   "name": "kb-starter",
   "displayName": "kb-starter 个人知识库",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "把零散的本地资料整理成分层的个人知识库，并让它持续生长：AI 起草知识库纲要、自己整理完再交给你一份整理规则审查（改一条规则就能把文件挪对），按纲要分项目和写总览、蒸馏成知识卡片、知识索引、缺口自检、体检与增长统计。",
   "author": { "name": "Lucas0ng" },
   "homepage": "https://github.com/Lucas0ng/kb-starter",

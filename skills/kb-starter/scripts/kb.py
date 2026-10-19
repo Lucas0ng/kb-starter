@@ -18,11 +18,13 @@
 from __future__ import annotations
 
 import argparse
+import codecs
 import csv
 import datetime as dt
 import difflib
 import fnmatch
 import hashlib
+import io
 import json
 import os
 import re
@@ -125,7 +127,7 @@ EXT = {
     "doc": {".doc", ".docx", ".odt", ".rtf", ".pages", ".wps"},
     "ppt": {".ppt", ".pptx", ".key", ".odp", ".dps"},
     "sheet": {".xls", ".xlsx", ".csv", ".tsv", ".ods", ".et"},
-    "instrument": {".spc", ".jdx", ".dx", ".xrdml", ".opj", ".opju", ".mnova", ".jcamp", ".chi", ".mpr", ".dta", ".txtx"},
+    "instrument": {".spc", ".jdx", ".dx", ".xrdml", ".opj", ".opju", ".mnova", ".jcamp", ".chi", ".mpr", ".dta"},
     "image": {".jpg", ".jpeg", ".png", ".heic", ".heif", ".tif", ".tiff", ".bmp", ".webp", ".gif"},
     "audio": {".m4a", ".mp3", ".wav", ".aac", ".amr", ".flac", ".ogg", ".opus"},
     "video": {".mp4", ".mov", ".mkv", ".avi", ".wmv", ".flv", ".webm"},
@@ -465,6 +467,9 @@ def read_user_rules(kb: Path | None) -> list[dict]:
         if cat and cat not in CATEGORIES and cat not in SKIP_WORDS:
             print(f"整理规则里的「{cat}」不是可用的类别，这一行先不用：{line.strip()}", file=sys.stderr)
             continue
+        if unsafe_name(proj):
+            print(f"整理规则里的项目名{unsafe_name(proj)}，这一行先不用：{line.strip()}", file=sys.stderr)
+            continue
         if not cat and not proj:
             continue
         rules.append({"n": len(rules) + 1, "匹配": pattern, "看哪里": where or "路径", "归为": cat, "项目": proj, "为什么": why})
@@ -513,21 +518,65 @@ def load_ignored(kb: Path) -> dict[str, str]:
     path = kb / ".kb" / "ignored.csv"
     if not path.exists():
         return {}
-    with path.open(encoding="utf-8-sig", newline="") as f:
-        return {row["sha256"]: row["原因"] for row in csv.DictReader(f)}
+    return {row["sha256"]: row["原因"] for row in read_csv_rows(path, "不入库记录 ignored.csv ", ("sha256", "原因"))}
 
 
 def load_manifest(kb: Path) -> dict[str, dict]:
     path = kb / ".kb" / "manifest.csv"
     if not path.exists():
         return {}
-    with path.open(encoding="utf-8-sig", newline="") as f:
-        return {row["sha256"]: row for row in csv.DictReader(f)}
+    return {row["sha256"]: row for row in read_csv_rows(path, "入库清单 manifest.csv ", ("sha256", "知识库路径"))}
+
+
+def read_csv_rows(path: Path, what: str, need: tuple[str, ...]) -> list[dict]:
+    """读 CSV，兼容 Excel 另存的编码：UTF-8（带不带 BOM）、GBK/GB18030（Windows 中文版直接 Ctrl+S）、UTF-16。"""
+    raw = path.read_bytes()
+    encodings = ("utf-16",) if raw.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)) else ("utf-8-sig", "gb18030")
+    text = None
+    for enc in encodings:
+        try:
+            text = raw.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    hint = "用 Excel 改过的话，请「另存为」→「CSV UTF-8（逗号分隔）」后再试"
+    if text is None:
+        print(f"{what}读不出来（不是 UTF-8、GBK 或 UTF-16 编码）。{hint}：{path}", file=sys.stderr)
+        sys.exit(2)
+    reader = csv.DictReader(io.StringIO(text, newline=""))
+    missing = [c for c in need if c not in (reader.fieldnames or [])]
+    if missing:
+        print(f"{what}的表头缺少「{'」「'.join(missing)}」，可能被改坏了或分隔符不是逗号。{hint}：{path}", file=sys.stderr)
+        sys.exit(2)
+    return list(reader)
 
 
 def read_plan(path: Path) -> list[dict]:
-    with path.open(encoding="utf-8-sig", newline="") as f:
-        return list(csv.DictReader(f))
+    return read_csv_rows(path, "方案表", ("id", "状态", "原路径"))
+
+
+UNSAFE_PART_RE = re.compile(r"[\\\x00-\x1f\x7f]")
+
+
+def unsafe_name(value: str, multi: bool = False) -> str:
+    """项目名、入库名会拼进路径，必须是一段普通名字；子目录（multi）可以多段，但每段都要普通。
+    返回问题描述，没问题返回空串。"""
+    v = (value or "").strip()
+    if not v:
+        return ""
+    parts = v.strip("/").split("/") if multi else [v]
+    for part in parts:
+        if part in ("", ".", "..") or UNSAFE_PART_RE.search(part) or "/" in part:
+            return f"「{value}」带路径符号（/ \\ .. 或控制字符），只能是一段普通名字"
+    return ""
+
+
+def inside(kb: Path, target: Path) -> bool:
+    try:
+        target.resolve().relative_to(kb.resolve())
+        return True
+    except ValueError:
+        return False
 
 
 def write_plan(path: Path, rows: list[dict]) -> None:
@@ -675,20 +724,31 @@ ICLOUD_RE = re.compile(r"^\.(.+)\.icloud$")
 FOLDER_COUNT_RE = re.compile(r"含 (\d+) 个文件")
 
 
-def count_files(d: Path) -> tuple[int, int]:
+def count_files(d: Path) -> tuple[int, int, int]:
+    """返回 (文件数, 总大小, 读不了的子文件夹数)。"""
     n = size = 0
-    for root, _, names in os.walk(d):
+    errors: list[OSError] = []
+    for root, _, names in os.walk(d, onerror=errors.append):
         for name in names:
             n += 1
             st = stat_quiet(Path(root) / name)
             size += st.st_size if st else 0
-    return n, size
+    return n, size, len(errors)
+
+
+UNREADABLE_DIR = "没有权限打开这个文件夹，里面的文件无法清点"
 
 
 def walk_source(src: Path, kb: Path | None) -> tuple[list[Path], list[dict]]:
-    """列出要处理的文件，以及不展开的文件夹（隐藏、依赖、符号链接）。两者合起来覆盖来源里的每一个文件。"""
+    """列出要处理的文件，以及不展开的文件夹（隐藏、依赖、符号链接、读不了的）。两者合起来覆盖来源里的每一个文件。
+    读不了的文件夹标 blocked：里面有多少文件不知道，对账不能说“一个不漏”。"""
     files, folders = [], []
-    for root, dirs, names in os.walk(src):
+
+    def unreadable(err: OSError) -> None:
+        folders.append({"path": Path(err.filename or src), "size": 0, "blocked": True,
+                        "reason": f"{UNREADABLE_DIR}（{err.strerror or err}）；改好权限后重新扫描"})
+
+    for root, dirs, names in os.walk(src, onerror=unreadable):
         root_p = Path(root)
         if kb and root_p == kb:
             # 扫描的是知识库本身：只看 A 层和 D 层；根目录入口文件、B/C 层笔记、工作区都不是“资料”
@@ -702,9 +762,10 @@ def walk_source(src: Path, kb: Path | None) -> tuple[list[Path], list[dict]]:
             if p.is_symlink():
                 folders.append({"path": p, "reason": f"符号链接文件夹，未跟随（指向 {os.path.realpath(p)}）", "size": 0})
             elif d.startswith(".") or d in SKIP_DIRS:
-                n, size = count_files(p)
-                if n:
-                    folders.append({"path": p, "reason": f"隐藏或依赖文件夹，含 {n} 个文件，未展开；需要其中的文件请拿出来再扫", "size": size})
+                n, size, bad = count_files(p)
+                if n or bad:
+                    more = f"（另有 {bad} 个子文件夹读不了，实际可能更多）" if bad else ""
+                    folders.append({"path": p, "reason": f"隐藏或依赖文件夹，含 {n} 个文件{more}，未展开；需要其中的文件请拿出来再扫", "size": size})
             else:
                 keep.append(d)
         dirs[:] = keep
@@ -772,6 +833,9 @@ def cmd_scan(args: argparse.Namespace) -> None:
     outline_path = Path(args.outline).expanduser().resolve() if args.outline else (kb / OUTLINE if kb else None)
     outline = read_outline(outline_path)
     oprojects = outline.get("projects", [])
+    for p in oprojects:
+        if unsafe_name(p["name"]):
+            print(f"纲要里的项目名{unsafe_name(p['name'])}；分到它的文件在 apply 时会被拦下，请先改纲要。", file=sys.stderr)
     onames = {p["name"] for p in oprojects}
     user_rules = read_user_rules(kb)
 
@@ -825,17 +889,20 @@ def cmd_scan(args: argparse.Namespace) -> None:
             continue
         seen[digest] = row["id"]
 
-        try:
-            status, cat, reason, conf, date, snippet = classify(path, rel)
-        except OSError as e:
-            blocked(row, f"读取内容失败（{e.strerror or e}）")
-            continue
+        # 隐私先于一切读取：文件名命中隐私词、又没有用户规则明确归类时，不打开内容、不留片段
+        privacy = kw_hits(" ".join(rel.parts), "隐私")
+        early_rule = apply_user_rule(user_rules, rel) if privacy else None
+        if privacy and not (early_rule and early_rule["归为"]):
+            status, cat, conf, date, snippet = STATUS_AI, "", "", "", ""
+            reason = f"疑似隐私文件（文件名含「{privacy[0]}」），没有读取内容，先问用户是否入库"
+        else:
+            try:
+                status, cat, reason, conf, date, snippet = classify(path, rel)
+            except OSError as e:
+                blocked(row, f"读取内容失败（{e.strerror or e}）")
+                continue
         if date:
             row["日期"] = date
-        privacy = kw_hits(" ".join(rel.parts), "隐私")
-        if privacy and status != STATUS_SKIP:
-            status, conf = STATUS_AI, ""
-            reason = f"疑似隐私文件（文件名含「{privacy[0]}」），先问用户是否入库；规则原判断：{cat or '无'}"
         # 有纲要时，项目以纲要为准：文件夹名是纲要项目 > 纲要关键词 > 按文件夹名猜的
         if oprojects and status in (STATUS_COPY, STATUS_AI):
             proj, why = outline_project(rel, snippet, oprojects)
@@ -869,11 +936,16 @@ def cmd_scan(args: argparse.Namespace) -> None:
                 row["目标目录"] = path.parent.relative_to(kb).as_posix()
         row.update({"状态": status, "类别": cat, "依据": reason, "置信度": conf})
         rows.append(row)
-        if status == STATUS_AI or snippet:
-            snippets.append({"id": row["id"], "文件名": path.name, "原路径": str(path), "状态": status, "片段": snippet[:600]})
+        # 片段只给需要 AI 判断的文件；隐私文件只留标记，不留内容
+        if status == STATUS_AI:
+            item = {"id": row["id"], "文件名": path.name, "原路径": str(path), "状态": status, "片段": snippet[:600]}
+            if "疑似隐私" in reason:
+                item.update({"片段": "", "隐私": "疑似隐私文件，没有读取内容；不要打开，按 SKILL.md 写「隐私待定」"})
+            snippets.append(item)
 
     for fd in folders:
-        rows.append({"id": str(len(rows) + 1), "状态": STATUS_SKIP, "文件名": fd["path"].name + "/", "原路径": str(fd["path"]),
+        rows.append({"id": str(len(rows) + 1), "状态": STATUS_BLOCKED if fd.get("blocked") else STATUS_SKIP,
+                     "文件名": fd["path"].name + "/", "原路径": str(fd["path"]),
                      "依据": fd["reason"], "置信度": "高", "大小KB": f"{fd['size'] / 1024:.0f}"})
 
     mark_versions(rows)
@@ -1009,6 +1081,10 @@ def cmd_decide(args: argparse.Namespace) -> None:
     items = data.get("items", {})
     by_id = {r["id"]: r for r in rows}
     errors = []
+    for old, new in list(renames.items()):
+        if unsafe_name(str(new)):
+            errors.append(f"rename_projects 里「{old}」的新项目名{unsafe_name(str(new))}")
+            del renames[old]
     for rid, d in items.items():
         r = by_id.get(str(rid))
         if r is None:
@@ -1018,10 +1094,14 @@ def cmd_decide(args: argparse.Namespace) -> None:
         if cat and cat not in CATEGORIES:
             errors.append(f"id {rid} 的类别「{cat}」不在可选类别里：{'、'.join(CATEGORIES)}")
             continue
+        bad = unsafe_name(str(d.get("项目", ""))) or unsafe_name(str(d.get("子目录", "")), multi=True)
+        if bad:
+            errors.append(f"id {rid} 的项目或子目录{bad}")
+            continue
         if "入库名" in d:
             new = str(d["入库名"]).strip()
             ext = Path(r["文件名"]).suffix
-            if not new or "/" in new or "\\" in new:
+            if not new or unsafe_name(new):
                 errors.append(f"id {rid} 的入库名「{new}」不能为空或带路径")
                 continue
             if not Path(new).suffix:
@@ -1340,6 +1420,10 @@ def reconcile(rows: list[dict], kb: Path, meta: dict, full: bool = False) -> tup
     file_rows = [r for r in rows if not r["文件名"].endswith("/")]
     folder_rows = [r for r in rows if r["文件名"].endswith("/")]
     in_folders = sum(int(m.group(1)) for r in folder_rows if (m := FOLDER_COUNT_RE.search(r["依据"])))
+    locked = [r for r in folder_rows if r["状态"] == STATUS_BLOCKED]
+    if locked:  # 里面有几个文件都不知道，就不能说一个不漏
+        problems.append(f"{len(locked)} 个文件夹没有权限打开，里面的文件没法清点，不能确认一个不漏（改好权限后重新扫描）："
+                        + "、".join(r["原路径"] for r in locked[:10]))
 
     # 1. 一个不漏：重新遍历来源，每个文件都要在方案里，或在“未展开的文件夹”里
     unplanned: list[str] = []
@@ -1394,8 +1478,16 @@ def reconcile(rows: list[dict], kb: Path, meta: dict, full: bool = False) -> tup
             except OSError:
                 pass
         elif r.get("修改时间"):
+            # Excel 改过的方案表会丢小数位，甚至写成 1.76E+09：丢到看不出秒的就不比，交给 --full
+            v = r["修改时间"].strip()
+            try:
+                recorded = float(v)
+            except ValueError:
+                continue
+            if "e" in v.lower():
+                continue
             st = stat_quiet(p)
-            if st and abs(st.st_mtime - float(r["修改时间"])) > 0.01:
+            if st and abs(st.st_mtime - recorded) > (0.01 if "." in v else 1.0):
                 changed.append(r["文件名"])
     if changed:
         problems.append(f"{len(changed)} 个原件在扫描之后被修改过（不是本工具改的）：" + "、".join(changed[:10]))
@@ -1410,6 +1502,8 @@ def reconcile(rows: list[dict], kb: Path, meta: dict, full: bool = False) -> tup
         f"- 原件检查（{'重新计算哈希' if full else '比对修改时间'}）：{'有改动' if changed else '均未改动'}",
         f"- 扫描后新增 {len(unplanned)} 个，消失 {len(vanished)} 个",
     ]
+    if locked:
+        body[0] += f" + 读不了的文件夹 {len(locked)} 个（里面的文件数未知）"
     if c.get(STATUS_BLOCKED):
         body.append(f"- ⚠ {c[STATUS_BLOCKED]} 个文件读不了，没有入库：" + "、".join(r["文件名"] for r in file_rows if r["状态"] == STATUS_BLOCKED))
     return problems, body
@@ -1440,6 +1534,27 @@ def cmd_apply(args: argparse.Namespace) -> None:
     if bad:
         print("这些条目的类别无效：" + "、".join(f"#{r['id']}「{r['类别']}」" for r in bad), file=sys.stderr)
         sys.exit(2)
+    # 项目名可能来自纲要、整理规则、decisions 或手改的 plan.csv：任何一处带路径符号都不写，一个文件都不复制
+    unsafe = []
+    for r in rows:
+        if r["状态"] in (STATUS_COPY, STATUS_AI):
+            why = (unsafe_name(r.get("项目", "")) or unsafe_name(r.get("子目录", ""), multi=True)
+                   or unsafe_name(r.get("入库名", "")))
+            if why:
+                unsafe.append(f"#{r['id']} {r['文件名']}：{why}")
+    if unsafe:
+        print("这些条目的项目、子目录或入库名不安全，没有写入任何文件（纲要或整理规则里的项目名也要改）：\n  "
+              + "\n  ".join(unsafe), file=sys.stderr)
+        sys.exit(2)
+    # 已有内容、又不是 kb-starter 建的文件夹：不能悄悄塞进骨架，要用户同意并入
+    if not args.merge and kb.is_dir() and not (kb / ".kb").exists():
+        others = sorted(p.name for p in kb.iterdir() if p.name != OUTLINE and p.name.lower() not in JUNK_NAMES)
+        if others:
+            shown = "、".join(others[:5]) + (f" 等 {len(others)} 项" if len(others) > 5 else "")
+            print(f"知识库文件夹里已经有内容（{shown}），但它不是 kb-starter 建的库（没有 .kb/）：{kb}\n"
+                  "先问用户是并入这个文件夹，还是另建一个。用户同意并入后加 --merge 重新运行（已有文件不会被覆盖）。",
+                  file=sys.stderr)
+            sys.exit(2)
 
     name = args.name or kb.name
     created = [] if args.dry_run else ensure_skeleton(kb, name)
@@ -1476,6 +1591,9 @@ def cmd_apply(args: argparse.Namespace) -> None:
             target_dir = kb / dest_dir(r["类别"], r["项目"], r.get("子目录", ""))
             fname = r.get("入库名") or src.name
             target = target_dir / fname
+            if not inside(kb, target):  # 上面已校验过名字；这里是最后一道防线
+                print(f"#{r['id']} 的目标路径在知识库外，已停止：{target}", file=sys.stderr)
+                sys.exit(2)
             n = 2
             while target.exists():
                 if sha256(target) == digest:
@@ -1753,6 +1871,9 @@ def cmd_reorg(args: argparse.Namespace) -> None:
                 removed.append(cur)
             continue
         target = kb / new
+        if not inside(kb, target):  # 规则里的项目名已校验过；这里是最后一道防线
+            print(f"规则 {rule['n']} 会把 {cur} 挪到知识库外，已跳过：{target}", file=sys.stderr)
+            continue
         n = 2
         while target.exists() and target != kb / cur:
             target = target.with_name(f"{Path(new).stem} ({n}){Path(new).suffix}")
@@ -2431,6 +2552,9 @@ def cmd_overview(args: argparse.Namespace) -> None:
     manifest = load_manifest(kb)
     today = dt.date.today()
     for p in projects:
+        if unsafe_name(p["name"]):
+            print(f"纲要里的项目名{unsafe_name(p['name'])}，跳过它的总览；请先改纲要。", file=sys.stderr)
+            continue
         files = [dict(m) for m in manifest.values() if m.get("项目") == p["name"]]
         for m in files:
             st = stat_quiet(kb / m["知识库路径"])
@@ -2544,6 +2668,7 @@ def main() -> None:
     a.add_argument("--name", help="知识库名称，用于入口文件标题")
     a.add_argument("--dry-run", action="store_true", help="只预演，不写文件")
     a.add_argument("--pending-to-unsorted", action="store_true", help="把仍是待AI的条目放进 09_待定")
+    a.add_argument("--merge", action="store_true", help="知识库文件夹已有内容、但不是 kb-starter 建的库时，用户同意后才并入")
     a.set_defaults(func=cmd_apply)
 
     v = sub.add_parser("verify", help="对账：原件完好、一个不漏、副本一致")
